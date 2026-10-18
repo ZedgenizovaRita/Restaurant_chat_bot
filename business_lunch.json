@@ -1,0 +1,55 @@
+{
+    "_help": "Меню YŪKI. price: число в рублях или null. category: appetizers | salads | sushi_rolls | soups | noodles | main_courses | street_food | desserts | drinks | null (для бизнес-ланчей). spicy / vegan / vegetarian: true, false или null (не знаю — блюдо не попадёт в фильтры). aliases: как ещё называют блюдо гости. Рекомендации, фильтры, цены и поиск блюд бот берёт только отсюда. Ключи, начинающиеся с _, игнорируются.",
+    "items": [
+        {
+            "name": "Tokyo Lunch",
+            "category": null,
+            "business_lunch": true,
+            "price": 690,
+            "description": "Мисо-суп, удон с курицей, зелёный чай",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Токио ланч",
+                "Токио Lunch",
+                "Токио"
+            ]
+        },
+        {
+            "name": "Bangkok Lunch",
+            "category": null,
+            "business_lunch": true,
+            "price": 790,
+            "description": "Том Ям с курицей, рис с овощами, домашний лимонад",
+            "spicy": true,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Бангкок ланч",
+                "Бангкок Lunch",
+                "Бангкок"
+            ]
+        },
+        {
+            "name": "YUQI Special Lunch",
+            "category": null,
+            "business_lunch": true,
+            "price": 890,
+            "description": "Мини-версия YUQI Black Ramen, гёдза с курицей, лимонад юдзу",
+            "spicy": null,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": true,
+            "aliases": [
+                "YŪKI Special Lunch",
+                "YUKI Special Lunch",
+                "Юки спешл ланч",
+                "Спешл ланч",
+                "Special Lunch"
+            ]
+        }
+    ]
+}

@@ -1,0 +1,361 @@
+{
+    "_help": "Меню YŪKI. price: число в рублях. category: appetizers | salads | sushi_rolls | soups | noodles | main_courses | street_food | desserts | drinks | null (для бизнес-ланчей). spicy / vegan / vegetarian: true, false или null (не знаю — блюдо не попадёт в фильтры). aliases: как ещё называют блюдо гости. Рекомендации, фильтры, цены и поиск блюд бот берёт только отсюда. Ключи, начинающиеся с _, игнорируются.",
+    "items": [
+        {
+            "name": "Креветки темпура",
+            "category": "appetizers",
+            "price": 590,
+            "description": "Хрустящие креветки с соусом сладкий чили",
+            "spicy": null,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Темпура с креветками",
+                "Креветки в темпуре"
+            ]
+        },
+        {
+            "name": "Гёдза с курицей",
+            "category": "appetizers",
+            "price": 450,
+            "description": "Японские жареные пельмени",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Гёдза",
+                "Гедза",
+                "Пельмени гёдза"
+            ]
+        },
+        {
+            "name": "Курица карааге",
+            "category": "appetizers",
+            "price": 490,
+            "description": "Хрустящая курица по-японски",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Карааге",
+                "Карагэ"
+            ]
+        },
+        {
+            "name": "Чука с ореховым соусом",
+            "category": "salads",
+            "price": 390,
+            "description": "Морские водоросли с кунжутным соусом",
+            "spicy": false,
+            "vegan": null,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Чука",
+                "Салат чука",
+                "Салат с водорослями"
+            ]
+        },
+        {
+            "name": "Салат с креветками и манго",
+            "category": "salads",
+            "price": 690,
+            "description": "Креветки, манго, авокадо, листья салата",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Салат с креветками",
+                "Салат с манго"
+            ]
+        },
+        {
+            "name": "Филадельфия",
+            "category": "sushi_rolls",
+            "price": 690,
+            "description": "Лосось, сливочный сыр, огурец",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Ролл Филадельфия"
+            ]
+        },
+        {
+            "name": "Калифорния",
+            "category": "sushi_rolls",
+            "price": 590,
+            "description": "Крабовый микс, авокадо, огурец, тобико",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Ролл Калифорния"
+            ]
+        },
+        {
+            "name": "YŪKI Dragon Roll",
+            "category": "sushi_rolls",
+            "price": 890,
+            "description": "Авторский ролл с лососем, угрём и соусом юдзу",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": true,
+            "aliases": [
+                "Юки Драгон ролл",
+                "Dragon Roll",
+                "Авторский ролл",
+                "YUKI Dragon Roll"
+            ]
+        },
+        {
+            "name": "Том Ям с креветками",
+            "category": "soups",
+            "price": 750,
+            "description": "Острый тайский суп с кокосовым молоком",
+            "spicy": true,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Том Ям",
+                "Суп Том Ям"
+            ]
+        },
+        {
+            "name": "Рамен со свининой",
+            "category": "soups",
+            "price": 750,
+            "description": "Лапша, свинина, яйцо, насыщенный бульон",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Рамен"
+            ]
+        },
+        {
+            "name": "Black Ramen",
+            "category": "soups",
+            "price": 890,
+            "description": "Чёрный рамен с говядиной, грибами и яйцом",
+            "spicy": null,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": true,
+            "aliases": [
+                "Блэк рамен",
+                "Чёрный рамен",
+                "Черный рамен",
+                "YŪKI Black Ramen"
+            ]
+        },
+        {
+            "name": "Удон с курицей",
+            "category": "noodles",
+            "price": 590,
+            "description": "Пшеничная лапша, курица, овощи, терияки",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Удон"
+            ]
+        },
+        {
+            "name": "Пад Тай с креветками",
+            "category": "noodles",
+            "price": 750,
+            "description": "Рисовая лапша, креветки, арахис, лайм",
+            "spicy": null,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Пад Тай",
+                "Пад тай",
+                "Pad Thai"
+            ]
+        },
+        {
+            "name": "Фунчоза с овощами",
+            "category": "noodles",
+            "price": 490,
+            "description": "Стеклянная лапша с овощами",
+            "spicy": false,
+            "vegan": null,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Фунчоза",
+                "Стеклянная лапша"
+            ]
+        },
+        {
+            "name": "Курица терияки",
+            "category": "main_courses",
+            "price": 690,
+            "description": "Куриное филе в соусе терияки с рисом",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Терияки с курицей",
+                "Курица в терияки"
+            ]
+        },
+        {
+            "name": "Лосось терияки",
+            "category": "main_courses",
+            "price": 990,
+            "description": "Филе лосося с рисом и овощами",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Терияки с лососем",
+                "Лосось в терияки"
+            ]
+        },
+        {
+            "name": "Корейский пибимпап",
+            "category": "main_courses",
+            "price": 790,
+            "description": "Рис, говядина, овощи, яйцо, острый соус",
+            "spicy": true,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Пибимпап",
+                "Бибимбап",
+                "Пибимбап"
+            ]
+        },
+        {
+            "name": "Бао с курицей",
+            "category": "street_food",
+            "price": 390,
+            "description": "Паровая булочка с курицей и овощами",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Бао",
+                "Булочка бао"
+            ]
+        },
+        {
+            "name": "Корейская жареная курица",
+            "category": "street_food",
+            "price": 650,
+            "description": "Хрустящая курица в сладко-остром соусе",
+            "spicy": true,
+            "vegan": false,
+            "vegetarian": false,
+            "signature": false,
+            "aliases": [
+                "Корейская курица",
+                "Курица по-корейски"
+            ]
+        },
+        {
+            "name": "Токпокки с сыром",
+            "category": "street_food",
+            "price": 550,
+            "description": "Корейские рисовые клёцки с острым соусом и сыром",
+            "spicy": true,
+            "vegan": false,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Токпокки",
+                "Топокки",
+                "Ттокпокки"
+            ]
+        },
+        {
+            "name": "Моти с манго",
+            "category": "desserts",
+            "price": 350,
+            "description": "Японский рисовый десерт с манго",
+            "spicy": false,
+            "vegan": null,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Моти",
+                "Мочи с манго"
+            ]
+        },
+        {
+            "name": "Матча-тирамису",
+            "category": "desserts",
+            "price": 490,
+            "description": "Тирамису с японским зелёным чаем",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Тирамису матча",
+                "Тирамису"
+            ]
+        },
+        {
+            "name": "Лимонад юдзу",
+            "category": "drinks",
+            "price": 390,
+            "description": "Освежающий лимонад с японским цитрусом",
+            "spicy": false,
+            "vegan": true,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Юдзу лимонад",
+                "Лимонад"
+            ]
+        },
+        {
+            "name": "Матча латте",
+            "category": "drinks",
+            "price": 390,
+            "description": "Молочный напиток с японским матча",
+            "spicy": false,
+            "vegan": false,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Матча",
+                "Латте матча"
+            ]
+        },
+        {
+            "name": "Американо",
+            "category": "drinks",
+            "price": 250,
+            "description": "Чёрный кофе",
+            "spicy": false,
+            "vegan": true,
+            "vegetarian": true,
+            "signature": false,
+            "aliases": [
+                "Кофе американо",
+                "Чёрный кофе",
+                "Черный кофе"
+            ]
+        }
+    ]
+}
