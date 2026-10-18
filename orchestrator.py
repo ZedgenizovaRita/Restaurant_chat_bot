@@ -47,6 +47,7 @@ from protocol import (ARROW, DialogHistory, Reply, TOOLS_WITH_RESULT, expects_an
 
 log = logging.getLogger("yuqi.orchestrator")
 
+RECENT_EXCHANGES = 4       
 FALLBACK_TEXT = ("Извините, я вас не понял. Я могу рассказать про меню, цены, бизнес-ланчи, адрес и часы работы, "
                  "а также забронировать столик. Попробуйте, пожалуйста, переформулировать.")
 RESET_TEXT = "Давайте начнём сначала. Чем могу помочь?"
@@ -114,7 +115,7 @@ class Session:
     bk: Optional[dict] = None                            # бронь, которую ведёт код: {"slots": {...}, "stage": collect|confirm}
     faq_only: bool = False                               # временная сессия для ответа на вопрос посреди брони
     offered_booking: bool = False                        # последний ответ модели предлагал забронировать
-    recent: list = field(default_factory=list)           # последние 2 завершённых обмена «User: … -> Bot: …» — контекст для модели
+    recent: list = field(default_factory=list)           # последние RECENT_EXCHANGES завершённых обменов «User: … -> Bot: …» — контекст для модели
     menu_ctx: dict = field(default_factory=dict)         # последний показанный список блюд («посоветуйте оттуда»); /reset стирает вместе с сессией
 
     def reset(self) -> None:
@@ -433,13 +434,13 @@ class Orchestrator:
 
     async def _run_turn(self, chat_id: int, sess: Session, user_text: str,
                         user_name: Optional[str] = None) -> TurnResult:
-        """Обёртка: модель получает последние 2 обмена как контекст («а в выходные?»), и обмен запоминается."""
+        """Обёртка: модель получает последние RECENT_EXCHANGES обменов как контекст («а в выходные?»), и обмен запоминается."""
         if sess.recent and not sess.history.done and not sess.faq_only:
             sess.history.done.extend(sess.recent)
         out = await self._run_turn_inner(chat_id, sess, user_text, user_name)
         if out.messages and not sess.faq_only and out.messages[0].text != FALLBACK_TEXT:
             sess.recent.append(self._segment(user_text, out.messages[0].text))
-            del sess.recent[:-2]
+            del sess.recent[:-RECENT_EXCHANGES]
         return out
 
     @staticmethod
