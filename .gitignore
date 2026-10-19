@@ -1,12 +1,13 @@
-# секреты и служебное — в репозиторий не попадает
 .env
 *.db
 __pycache__/
 *.pyc
-
-# веса модели слишком большие для обычного git — выкладываются отдельно (см. README)
 out-rugpt/
+yuqi_model/
 out-yuqi/
 *.safetensors
 *.bin
 *.pt
+.venv/
+*.zip
+mini-tron-50/

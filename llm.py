@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-llm.py —загрузка обученного nanoGPT и генерация ответа бота.
+llm.py — загрузка обученной модели (папка yuqi_model: mini-tron-50/nanoGPT, или out-rugpt) и генерация ответа бота.
 
 Что делает:
-  - не привязан к конкретной модели: ядро LLM принимает ЛЮБОЙ torch-модуль (nanoGPT, форк
-    nanoGPT, GPT-2 из HuggingFace) + функции encode/decode + block_size;
-  - для чекпоинта в формате nanoGPT есть готовая фабрика LLM.from_nanogpt(...);
+  - LLM.from_hf(папка) загружает модель и токенайзер;
   - generate(prompt) дописывает текст после "-> Bot:" и ОСТАНАВЛИВАЕТСЯ на конце ответа
     (перевод строки, "||", <|endoftext|>) — в отличие от model.generate из nanoGPT,
     который всегда генерирует ровно max_new_tokens токенов;
@@ -15,14 +13,12 @@ llm.py —загрузка обученного nanoGPT и генерация о
     неуверенные ответы («не понял, переформулируйте»);
   - fit_prompt режет историю диалога по границам сегментов, чтобы не вылезти за block_size.
 
-Зависимости: torch; tiktoken (если токенайзер GPT-2 BPE); model.py вашей модели (для from_nanogpt).
+Зависимости: torch, transformers, sentencepiece.
 """
 from __future__ import annotations
 
 import asyncio
 import os
-import pickle
-import sys
 import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
@@ -70,27 +66,6 @@ def fit_prompt(prompt: str, count_tokens: Callable[[str], int], max_tokens: int)
     return out
 
 
-# ---------------------------------------------------------------- токенайзеры
-def char_tokenizer(meta_path: str):
-    """Токенайзер на символах (meta.pkl из nanoGPT). -> (encode, decode, eot_id, valid_vocab)"""
-    with open(meta_path, "rb") as f:
-        meta = pickle.load(f)
-    stoi, itos = meta["stoi"], meta["itos"]
-    # символ вне словаря (эмодзи и т.п.) молча пропускаем — модель его не знает
-    encode = lambda s: [stoi[c] for c in s if c in stoi]
-    decode = lambda ids: "".join(itos[i] for i in ids)
-    return encode, decode, None, len(stoi)
-
-
-def bpe_tokenizer():
-    """GPT-2 BPE через tiktoken. -> (encode, decode, eot_id, valid_vocab)"""
-    import tiktoken
-    enc = tiktoken.get_encoding("gpt2")
-    # disallowed_special=() — спецтокены в тексте пользователя кодируются как обычный текст
-    encode = lambda s: enc.encode(s, disallowed_special=())
-    return encode, enc.decode, enc.eot_token, enc.n_vocab
-
-
 def _last_logits(out):
     """Достаёт логиты последней позиции из ответа модели любого типа:
     nanoGPT -> (logits, loss); HuggingFace -> объект с .logits; просто тензор."""
@@ -130,61 +105,42 @@ class LLM:
         self.eot_id = eot_id
         self.valid_vocab = valid_vocab
         self.hf = False
+        self.stop_ids: set = set()      # доп. токены-стоп (роли чат-шаблона)
         self._lock = threading.Lock()   # одна генерация за раз (бот может получать сообщения параллельно)
-
-    # -------- фабрика: чекпоинт nanoGPT (ключи 'model_args' и 'model') или его форк с теми же ключами
-    @classmethod
-    def from_nanogpt(cls, ckpt_path: str, nanogpt_dir: str,
-                     device: Optional[str] = None, meta_path: Optional[str] = None) -> "LLM":
-        """
-        nanogpt_dir — папка с model.py вашей модели (оригинальный nanoGPT или ваш форк);
-                      оттуда берутся классы GPT и GPTConfig.
-        meta_path   — meta.pkl, если обучали на символах (по умолчанию ищется
-                      nanogpt_dir/data/<dataset>/meta.pkl по config из чекпоинта).
-        """
-        import torch
-
-        if nanogpt_dir not in sys.path:
-            sys.path.insert(0, nanogpt_dir)
-        from model import GPT, GPTConfig
-
-        device = device or (
-            "cuda" if torch.cuda.is_available()
-            else "mps" if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available()
-            else "cpu"
-        )
-        try:
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
-        except Exception:  # чекпоинт с произвольными объектами; файл свой, доверенный
-            ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
-
-        model = GPT(GPTConfig(**ckpt["model_args"]))
-        model.load_state_dict({k.removeprefix("_orig_mod."): v for k, v in ckpt["model"].items()})
-
-        cfg = ckpt.get("config", {}) or {}
-        if meta_path is None and "dataset" in cfg:
-            cand = os.path.join(nanogpt_dir, "data", cfg["dataset"], "meta.pkl")
-            meta_path = cand if os.path.exists(cand) else None
-        encode, decode, eot_id, valid = (
-            char_tokenizer(meta_path) if meta_path and os.path.exists(meta_path) else bpe_tokenizer()
-        )
-        return cls(model, encode, decode, model.config.block_size,
-                   device=device, eot_id=eot_id, valid_vocab=valid)
 
     # -------- фабрика: модель HuggingFace (ruGPT и т.п.), папка после save_pretrained
     @classmethod
     def from_hf(cls, model_dir: str, device: Optional[str] = None) -> "LLM":
-        """model_dir — папка с config.json, весами и токенизатором (например out-rugpt из finetune_hf.py)."""
+        """model_dir — папка с config.json, весами и токенизатором (yuqi_model из training/colab_minitron.ipynb или out-rugpt)."""
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        tok = AutoTokenizer.from_pretrained(model_dir)
+        if not os.path.isdir(model_dir):
+            raise SystemExit(f"Папка модели не найдена: {os.path.abspath(model_dir)}\n"
+                             "Укажите путь к папке модели, например: set MODEL_DIR=yuqi_model")
         model = AutoModelForCausalLM.from_pretrained(model_dir)
         cfg = model.config
         block = getattr(cfg, "n_positions", None) or cfg.max_position_embeddings
         device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        llm = cls(model, lambda s: tok.encode(s, add_special_tokens=False), lambda ids: tok.decode(ids, clean_up_tokenization_spaces=False),
-                  block, device=device, eot_id=tok.eos_token_id)
+        if device == "cpu":
+            model = model.float()                       # веса могут быть сохранены в float16; на процессоре считаем во float32
+        sp_meta = os.path.join(model_dir, "yuqi_tokenizer.json")
+        if os.path.exists(sp_meta):                     # mini-tron-50 (nanoGPT): токенайзер SentencePiece
+            import json
+            import sentencepiece as spm
+            sp = spm.SentencePieceProcessor(model_file=os.path.join(model_dir, "tokenizer.model"))
+            m = json.load(open(sp_meta, encoding="utf-8"))
+            if m.get("format") == "chat":               # родной чат-шаблон модели (см. chatfmt.py)
+                from chatfmt import ChatIds
+                ch = ChatIds(sp, m["eot_id"], m["user_id"], m["assistant_id"], m.get("system_id"), m.get("system", ""))
+                llm = cls(model, ch.encode, ch.decode, block, device=device, eot_id=m["eot_id"])
+                llm.stop_ids = ch.stop_ids
+            else:
+                llm = cls(model, lambda s: sp.encode(s), lambda ids: sp.decode(ids), block, device=device, eot_id=m["eot_id"])
+        else:                                           # ruGPT и другие модели с токенайзером HuggingFace
+            tok = AutoTokenizer.from_pretrained(model_dir)
+            llm = cls(model, lambda s: tok.encode(s, add_special_tokens=False), lambda ids: tok.decode(ids, clean_up_tokenization_spaces=False),
+                      block, device=device, eot_id=tok.eos_token_id)
         llm.hf = True                                  # включает кэш ключей/значений (быстрая генерация)
         return llm
 
@@ -231,7 +187,7 @@ class LLM:
 
                 tid = int(nxt.item())
                 logps.append(float(logp[0, tid]))
-                if self.eot_id is not None and tid == self.eot_id:
+                if (self.eot_id is not None and tid == self.eot_id) or tid in self.stop_ids:
                     stop = "eot"
                     break
                 new_ids.append(tid)
@@ -256,15 +212,12 @@ if __name__ == "__main__":
     import argparse
     import time
 
-    ap = argparse.ArgumentParser(description="Проверка загрузки чекпоинта и генерации")
-    ap.add_argument("--model", default=None, help="папка HuggingFace-модели (out-rugpt)")
-    ap.add_argument("--ckpt", default=None, help="путь к ckpt.pt (nanoGPT)")
-    ap.add_argument("--nanogpt", default=None, help="папка репозитория nanoGPT")
-    ap.add_argument("--meta", default=None, help="путь к meta.pkl (если char-level)")
+    ap = argparse.ArgumentParser(description="Проверка загрузки модели и генерации")
+    ap.add_argument("--model", required=True, help="папка модели (yuqi_model)")
     args = ap.parse_args()
 
     t0 = time.time()
-    llm = LLM.from_hf(args.model) if args.model else LLM.from_nanogpt(args.ckpt, args.nanogpt, meta_path=args.meta)
+    llm = LLM.from_hf(args.model)
     print(f"загружено за {time.time() - t0:.1f} c, device={llm.device}, block_size={llm.block_size}")
 
     tests = [

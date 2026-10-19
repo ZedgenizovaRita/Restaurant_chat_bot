@@ -4,7 +4,7 @@ main.py — запуск Telegram-бота YUQI (python-telegram-bot v20+).
 
     pip install -r requirements.txt
     export BOT_TOKEN=...            # токен от @BotFather
-    export MODEL_DIR=out-rugpt      # папка модели HuggingFace (результат finetune_hf.py)
+    export MODEL_DIR=yuqi_model     # папка модели (результат training/colab_minitron.ipynb)
     export MANAGER_CHAT_ID=123456789      # куда слать жалобы (узнать id: @userinfobot); можно не задавать
     export ALLOW_RESET=1                  # команда /reset (стирает диалог и брони чата) — для тестов; в бою поставьте 0
     python main.py
@@ -93,16 +93,28 @@ async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def main() -> None:
-    llm = LLM.from_hf(os.environ.get("MODEL_DIR", "out-rugpt"))       # папка модели HuggingFace
+    default_dir = "yuqi_model" if os.path.isdir("yuqi_model") or not os.path.isdir("out-rugpt") else "out-rugpt"
+    model_dir = os.environ.get("MODEL_DIR", default_dir)               # папка модели (yuqi_model — mini-tron-50 после дообучения)
+    from model_fetch import download_model, has_model
+    if not has_model(model_dir) and os.environ.get("MODEL_URL"):         # хостинг: модели нет в репозитории — качаем из Releases
+        log.info("модели нет в %s, скачиваю %s", model_dir, os.environ["MODEL_URL"])
+        download_model(os.environ["MODEL_URL"], model_dir, progress=False)
+    llm = LLM.from_hf(model_dir)
     log.info("модель загружена: device=%s block_size=%s", llm.device, llm.block_size)
-    orch = Orchestrator(llm, BookingDB(os.environ.get("DB_PATH", "yuqi.db")))
+    orch = Orchestrator(llm, BookingDB(os.environ.get("DB_PATH", "yuqi.db")),
+                        temperature=float(os.environ.get("TEMPERATURE", "0")))   # 0 — всегда одинаковые формулировки
 
     async def post_init(a: Application) -> None:                  # подсказка команд в меню Telegram
         from telegram import BotCommand
         cmds = [BotCommand("start", "Начать сначала")] + ([BotCommand("reset", "Стереть диалог и брони (тест)")] if a.bot_data.get("allow_reset") else [])
         await a.bot.set_my_commands(cmds)
 
-    app = Application.builder().token(os.environ["BOT_TOKEN"]).concurrent_updates(True).post_init(post_init).build()
+    builder = Application.builder().token(os.environ["BOT_TOKEN"]).concurrent_updates(True).post_init(post_init)
+    proxy = os.environ.get("TELEGRAM_PROXY", "").strip()                # необязательно: socks5://user:pass@host:port или http://host:port
+    if proxy:
+        builder = builder.proxy(proxy).get_updates_proxy(proxy)
+        log.info("Telegram через прокси: %s", proxy.split("@")[-1])      # пароль в лог не пишем
+    app = builder.build()
     app.bot_data["orch"] = orch
     app.bot_data["manager_chat_id"] = int(os.environ["MANAGER_CHAT_ID"]) if os.environ.get("MANAGER_CHAT_ID") else None
     app.bot_data["allow_reset"] = os.environ.get("ALLOW_RESET", "1") != "0"

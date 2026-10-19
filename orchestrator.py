@@ -1,6 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-orchestrator.py - Цикл «модель -> действие -> инструмент -> модель».
+orchestrator.py — сердце бота. Цикл «модель -> действие -> инструмент -> модель».
+
+    result = await orch.handle_text(chat_id, "Хочу столик на двоих завтра в 19:00, Рита", user_name="Рита")
+    for m in result.messages: ...отправить m.text (m.html -> parse_mode="HTML")
+    for n in result.notices:  ...отправить n.text администратору
+
+Бот работает только текстом: никаких форм и кнопок. Все диалоги — как в датасете v5.
 
 Как идёт один ход:
   1. реплика пользователя очищается (sanitize_user_text) и добавляется в историю;
@@ -25,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import difflib
 import html
 import re
 from dataclasses import dataclass, field
@@ -47,7 +54,40 @@ from protocol import (ARROW, DialogHistory, Reply, TOOLS_WITH_RESULT, expects_an
 
 log = logging.getLogger("yuqi.orchestrator")
 
-RECENT_EXCHANGES = 4       
+FAQ_FALLBACK = [   # запасные ответы на вопросы про ресторан, если модель не справилась (факты те же, что в датасете)
+    (re.compile(r"до скольки|врем\w* работы|час\w* работы|режим|график|во сколько (?:откр|закр)|когда (?:откр|закр)|работаете|открыты|открываетесь|закрываетесь"),
+     ["Мы открыты каждый день с 10:00 до 23:00. По будням с 12:00 до 16:00 у нас ещё действуют бизнес-ланчи.",
+      "YUQI работает ежедневно с 10:00 до 23:00, а бизнес-ланчи подаём по будням с 12:00 до 16:00."]),
+    (re.compile(r"адрес|где (?:вы )?(?:находитесь|расположен|находится)|как (?:до вас )?добрать|как вас найти|где ресторан|местоположение|дорог"),
+     ["Мы находимся в Москве, на Большой Никитской, 24/1. Адрес можно ввести в любое приложение с картами.",
+      "Ждём вас по адресу: Москва, ул. Большая Никитская, 24/1."]),
+    (re.compile(r"алкогол|вино|пиво|виски|коктейл|шампанск|спиртн"),
+     ["К сожалению, алкогольных напитков в ресторане нет, зато есть лимонад юдзу, матча латте и кофе.", "Нет, алкоголя у нас нет — из напитков есть лимонад юдзу, матча латте и американо."]),
+    (re.compile(r"бонус|накопительн|программ\w* лояльн|кэшбэк|кешбэк|карт\w* лояльн"),
+     ["Бонусной системы у нас пока нет. Если появятся вопросы по меню или брони — с радостью помогу."]),
+    (re.compile(r"wi.?fi|вайфай|вай-фай|интернет"), ["Да, для гостей ресторана есть бесплатный Wi-Fi."]),
+    (re.compile(r"парковк|машин"), ["Да, рядом с рестораном есть бесплатная парковка."]),
+    (re.compile(r"достав|самовывоз|навынос|с собой|оформи\w* заказ"),
+     ["Заказы на самовывоз и доставку здесь не оформляются, но я могу показать меню, подсказать состав и цену блюд или забронировать столик."]),
+]
+GENERIC_RE = re.compile(r"чем могу помочь|чем могу быть полезен|чем вам помочь")   # приветствие/«что умею»: не держим в истории
+TOPIC_GUARD = [   # (вопрос гостя, что обязано быть в ответе модели, запасные ответы) — модель ответила не на тот вопрос -> ответ кода
+    (re.compile(r"^(?:ну |а |и )?(?:привет\w*|здравствуй\w*|здрасте|добрый (?:день|вечер)|доброе утро|хай|hello|hi|ку)\W*$|что (?:ты )?(?:умеешь|можешь)|чем (?:ты )?(?:можешь )?помочь|кто ты|ты бот|ты робот"),
+     re.compile(r"помощник|помогу|подскажу|расскажу|умею"),
+     ["Здравствуйте! Я помощник ресторана YUQI: подскажу по меню, ценам и составу блюд, бизнес-ланчам, адресу и часам работы, помогу забронировать или отменить столик. Чем могу помочь?"]),
+    (re.compile(r"собак|кошк|животн|питом|с детьми|с ребенк|с ребёнк|детск\w* (?:меню|стул)|веранд|живая музык|кальян|курить|курение|караоке|банкет|дресс"),
+     re.compile(r"информац|не могу подсказать|подсказать не могу|уточн"),
+     ["К сожалению, точной информации об этом у меня нет. Могу рассказать про меню или помочь забронировать столик.",
+      "Об этом, увы, подсказать не могу — такой информации у меня нет. Зато с меню и бронью помогу с радостью."]),
+]
+COMPLAINT_RE = re.compile(r"не понравил|ужасн|отвратит|невкусн|плох\w* (?:обслуж|еда|сервис)|хамств|нагруб|грязн|долго ждал|холодн\w* (?:суп|блюд|еда)|разочарован|отравил|недовол")
+PRAISE_RE = re.compile(r"(?<!не )понравил|было (?:очень )?вкусно|спасибо за (?:вечер|ужин|обед)|всё супер|все супер|отличн\w* (?:место|кухня|ресторан)|вернёмся|вернемся")
+FAQ_MUST = [re.compile(r"\d{1,2}:\d{2}|кругл|без выходн"), re.compile(r"никитск|24/1|адрес"), re.compile(r"алкогол|не подаём|не подаем|нет"),
+            re.compile(r"бонус|программ|лояльн|накопит"), re.compile(r"wi.?fi|вайфай|интернет"), re.compile(r"парковк"),
+            re.compile(r"достав|самовывоз|навынос|в зале|с собой|заказ")]
+MENU_ACTIONS = {"show_menu", "call_menu_filter_agent", "show_business_lunch"}
+MENU_INTROS = ["Конечно, вот что у нас есть:", "С удовольствием! Смотрите:", "Давайте посмотрим, что нашлось:"]
+RECENT_EXCHANGES = 2        # сколько последних обменов «вопрос-ответ» передаётся модели как контекст
 FALLBACK_TEXT = ("Извините, я вас не понял. Я могу рассказать про меню, цены, бизнес-ланчи, адрес и часы работы, "
                  "а также забронировать столик. Попробуйте, пожалуйста, переформулировать.")
 RESET_TEXT = "Давайте начнём сначала. Чем могу помочь?"
@@ -97,6 +137,7 @@ class TurnResult:
     messages: list[Message] = field(default_factory=list)
     notices: list[ManagerNotice] = field(default_factory=list)
     steps: list[dict] = field(default_factory=list)   # отладка: что генерировала модель
+    rejected: bool = False                            # ответ модели не годился, сработал запасной вариант
 
 
 @dataclass
@@ -116,7 +157,12 @@ class Session:
     faq_only: bool = False                               # временная сессия для ответа на вопрос посреди брони
     offered_booking: bool = False                        # последний ответ модели предлагал забронировать
     recent: list = field(default_factory=list)           # последние RECENT_EXCHANGES завершённых обменов «User: … -> Bot: …» — контекст для модели
+    recent_full: list = field(default_factory=list)      # те же обмены целиком (user, bot) — для проверки «модель повторила прошлый ответ»
     menu_ctx: dict = field(default_factory=dict)         # последний показанный список блюд («посоветуйте оттуда»); /reset стирает вместе с сессией
+
+    def forget_recent(self) -> None:
+        self.recent.clear()
+        self.recent_full.clear()
 
     def reset(self) -> None:
         self.history.reset()
@@ -132,7 +178,7 @@ class Orchestrator:
                  min_logprob: Optional[float] = -1.5, session_ttl_min: int = 30,
                  max_tool_steps: int = 6, confirm_booking: bool = True, code_cancel: bool = True,
                  grounding: bool = True, show_progress: bool = True, code_booking: bool = True,
-                 code_menu: bool = True, rng: Optional[random.Random] = None,
+                 code_menu: bool = True, rng: Optional[random.Random] = None, temperature: float = 0.0,
                  now_fn: Callable[[], datetime] = moscow_now) -> None:
         """
         llm          — объект с async agenerate(prompt) -> GenResult (llm.LLM)
@@ -142,13 +188,15 @@ class Orchestrator:
         code_menu    — вопросы про меню (фильтры, рекомендации, «какие есть удоны», состав, цена) отвечает код по menu.json
         code_booking — сбор брони (дата, время, гости, имя) ведёт код, а не модель: исправления гостя всегда перезаписывают старое
         show_progress — показывать служебные фразы модели («Проверяю время.»)
+        temperature  — свобода формулировок: >0 — обычный текстовый ответ (не команда) генерируется заново с этой температурой;
+                       цифры (время, цены, адрес) должны остаться как в базовом ответе, иначе берётся базовый. 0 — отключено.
         min_logprob  — порог уверенности модели (средняя log-вероятность токенов ответа);
                        ниже порога -> запасной ответ. None отключает проверку. Подберите на своих данных.
         """
         self.llm, self.db, self.menu = llm, booking_db, menu
         self.min_logprob, self.ttl_min, self.max_tool_steps, self.now = min_logprob, session_ttl_min, max_tool_steps, now_fn
         self.confirm_booking, self.code_cancel, self.grounding, self.show_progress = confirm_booking, code_cancel, grounding, show_progress
-        self.code_booking = code_booking
+        self.code_booking, self.temperature = code_booking, temperature
         self.code_menu, self.rng = code_menu, rng or random.Random()
         self._sessions: dict[int, Session] = {}
         self._progress = None
@@ -166,7 +214,7 @@ class Orchestrator:
         """Сбросить диалог (например, по команде /start)."""
         if chat_id in self._sessions:
             self._sessions[chat_id].reset()
-            self._sessions[chat_id].recent.clear()
+            self._sessions[chat_id].forget_recent()
 
     def wipe(self, chat_id: int) -> tuple[int, int]:
         """/reset для тестов: забыть диалог и стереть брони и отзывы этого чата. -> (броней, отзывов)."""
@@ -201,7 +249,7 @@ class Orchestrator:
             now = self.now()
             if sess.last_active and (now - sess.last_active).total_seconds() > self.ttl_min * 60:
                 sess.reset()                                             # диалог «остыл»
-                sess.recent.clear()
+                sess.forget_recent()
             sess.last_active = now
 
             clean = sanitize_user_text(text)
@@ -434,21 +482,51 @@ class Orchestrator:
 
     async def _run_turn(self, chat_id: int, sess: Session, user_text: str,
                         user_name: Optional[str] = None) -> TurnResult:
-        """Обёртка: модель получает последние RECENT_EXCHANGES обменов как контекст («а в выходные?»), и обмен запоминается."""
-        if sess.recent and not sess.history.done and not sess.faq_only:
+        """Обёртка: модель получает последние RECENT_EXCHANGES обменов как контекст («а в выходные?»), и обмен запоминается.
+
+        В контекст попадают только завершённые текстовые ответы модели — ровно в том виде, в каком такие
+        многошаговые диалоги лежат в датасете («User: … -> Bot: … || User: … -> Bot:»). Ответы кода (меню, бронь)
+        и ответы с ACTION в контекст не идут."""
+        fresh = not sess.history.done
+        use_ctx = fresh and bool(sess.recent) and not sess.faq_only
+        if use_ctx:
             sess.history.done.extend(sess.recent)
+        prev = list(sess.recent_full) if use_ctx else []
         out = await self._run_turn_inner(chat_id, sess, user_text, user_name)
-        if out.messages and not sess.faq_only and out.messages[0].text != FALLBACK_TEXT:
+        if use_ctx and (out.rejected or self._copies_context(out, prev, user_text)):
+            # маленькая модель иногда повторяет прошлый ответ из контекста — тогда отвечаем без контекста
+            log.warning("chat=%s: ответ отклонён или повторяет прошлый, повтор без контекста", chat_id)
+            sess.reset()
+            out = await self._run_turn_inner(chat_id, sess, user_text, user_name)
+        if (fresh and not sess.faq_only and not out.rejected and len(out.steps) == 1 and out.steps[0]["action"] is None
+                and out.messages and not out.messages[0].html and not sess.history.done
+                and not GENERIC_RE.search(out.messages[0].text.lower())
+                and not (sess.bk or sess.pending_book or sess.pending_cancel or sess.in_booking)):
             sess.recent.append(self._segment(user_text, out.messages[0].text))
-            del sess.recent[:-RECENT_EXCHANGES]
+            sess.recent_full.append((user_text, out.messages[0].text))
+            del sess.recent[:-RECENT_EXCHANGES], sess.recent_full[:-RECENT_EXCHANGES]
         return out
 
     @staticmethod
+    def _copies_context(out: TurnResult, prev: list, user_text: str) -> bool:
+        """Модель скопировала прошлый ответ: почти дословно, или похоже и это снова общее «чем могу помочь»."""
+        if not out.messages or out.messages[0].html:
+            return False
+        norm_text = lambda x: re.sub(r"\W+", " ", x.lower()).strip()
+        first, u = norm_text(out.messages[0].text), norm_text(user_text)
+        for pu, pb in prev:
+            if not pb or norm_text(pu) == u:
+                continue                                                 # гость сам повторил вопрос — одинаковый ответ нормален
+            ratio = difflib.SequenceMatcher(None, first, norm_text(pb)).ratio()
+            if ratio >= 0.9 or (ratio >= 0.55 and "чем могу помочь" in first):
+                return True
+        return False
+
+    @staticmethod
     def _segment(user_text: str, bot_text: str) -> str:
-        """Короткий сегмент для контекста: у списков берём заголовок (первую строку), без разметки и служебных символов."""
-        line = re.sub(r"<[^>]+>", "", bot_text).strip().splitlines()[0] if bot_text.strip() else ""
-        line = html.unescape(line).replace("->", " ").replace("||", " ")
-        line = re.sub(r"\s+", " ", line).strip()[:140]
+        """Сегмент контекста в формате датасета: «User: вопрос -> Bot: ответ»."""
+        line = html.unescape(re.sub(r"<[^>]+>", "", bot_text)).replace("->", " ").replace("||", " ")
+        line = re.sub(r"\s+", " ", line).strip()[:400]
         return f"User: {sanitize_user_text(user_text)}{ARROW} {line}".rstrip()
 
     async def _run_turn_inner(self, chat_id: int, sess: Session, user_text: str,
@@ -476,6 +554,12 @@ class Orchestrator:
             if problem:
                 log.warning("chat=%s: %s | prompt=...%s | raw=%r", chat_id, problem, prompt[-120:], reply.raw)
                 return self._reject(sess, out, user_text)
+            if self.grounding and len(out.steps) == 1:
+                fix = self._topic_guard(chat_id, user_name, user_text, reply, out)
+                if fix:
+                    log.warning("chat=%s: ответ модели не по теме вопроса: %r", chat_id, reply.raw)
+                    sess.reset()
+                    return fix
 
             # --- бронь ведёт код: модель в ней не участвует
             if self.code_booking and ((not reply.has_action and BOOKING_ASK_RE.search(reply.text.lower()))
@@ -499,6 +583,7 @@ class Orchestrator:
 
             # --- обычный текстовый ответ
             if not reply.has_action:
+                reply = await self._vary(prompt, reply)
                 early = self._early_time_check(reply.text) if self.grounding else None
                 if early:                                                # время уже прошло / вне часов — говорим сразу
                     out.messages.append(Message(early))
@@ -506,8 +591,8 @@ class Orchestrator:
                     return out
                 out.messages.append(Message(reply.text))
                 h.commit(reply.raw)
-                if not expects_answer(reply):
-                    sess.reset()                                         # вопрос закрыт — диалог закончен
+                if not expects_answer(reply) or GENERIC_RE.search(reply.text.lower()):
+                    sess.reset()                                         # вопрос закрыт (или это приветствие) — диалог закончен
                 if self.code_booking and re.search(r"забронир|столик", reply.text.lower()) and reply.text.rstrip().endswith("?"):
                     sess.offered_booking = True                          # «Хотите забронировать?» -> «да» запускает бронь
                 return out
@@ -544,7 +629,10 @@ class Orchestrator:
                 continue
 
             # --- конечные действия
-            if reply.text:
+            if reply.action in MENU_ACTIONS:
+                # перед меню модель любит «досочинять» (блюда, остроту) — текст заменяем безопасным вступлением, факты даст код
+                out.messages.append(Message(self.rng.choice(MENU_INTROS)))
+            elif reply.text:
                 out.messages.append(Message(reply.text))
             self._run_terminal(chat_id, user_name, user_text, reply, out)
             h.commit(reply.raw)
@@ -556,6 +644,25 @@ class Orchestrator:
         out.messages.append(Message(FALLBACK_TEXT))
         return out
 
+    async def _vary(self, prompt: str, reply: Reply) -> Reply:
+        """Свобода формулировок: тот же ответ, но модель переписывает его сама (temperature>0). Факты не трогаем:
+        цифры должны совпасть с базовым (жадным) ответом, вопросительность и длина — тоже, иначе остаётся базовый."""
+        if self.temperature <= 0 or not reply.text:
+            return reply
+        try:
+            gen2 = await self.llm.agenerate(prompt, temperature=self.temperature, top_k=40)
+        except Exception:
+            return reply
+        r2 = parse_reply(gen2.text)
+        if r2.has_action or not r2.text or self._problem(gen2, r2):
+            return reply
+        digits = lambda x: sorted(re.findall(r"\d+", x))
+        if digits(r2.text) != digits(reply.text) or r2.text.rstrip().endswith("?") != reply.text.rstrip().endswith("?"):
+            return reply
+        if not 0.6 <= len(r2.text) / max(len(reply.text), 1) <= 1.6:
+            return reply
+        return r2
+
     def _reject(self, sess: Session, out: TurnResult, user_text: str) -> TurnResult:
         """Ответ модели не годится: пробуем понять гостя по ключевым словам (опечатки), иначе — «не понял»."""
         sess.reset()
@@ -566,9 +673,46 @@ class Orchestrator:
             out.messages += [Message(t, True) for t in tool_filter(flt, self._menu())]
         elif self.grounding and looks_like_menu(user_text):
             out.messages += [Message(t, True) for t in tool_show_menu("all", self._menu())]
+        elif (faq := self._faq_fallback(user_text)):
+            out.messages.append(Message(faq))
         else:
             out.messages.append(Message(FALLBACK_TEXT))
+        out.rejected = True
         return out
+
+    def _topic_guard(self, chat_id: int, user_name: Optional[str], user_text: str, reply: Reply, out: TurnResult) -> Optional[TurnResult]:
+        """Модель ответила складно, но не на тот вопрос (на «Привет» — про Wi-Fi, на жалобу — «спасибо»): отвечает код."""
+        t, r = norm(user_text), (reply.text + " " + (reply.action or "")).lower()
+        if reply.action in BOOKING_ACTIONS or reply.action in TOOLS_WITH_RESULT:
+            return None
+        # отзывы: жалоба должна получить извинение и тихое уведомление, похвала — благодарность
+        if COMPLAINT_RE.search(t) and not re.search(r"жаль|извин|прости|сожален", r):
+            res = TurnResult(steps=out.steps)
+            res.messages.append(Message(self.rng.choice([
+                "Нам очень жаль, что вы остались недовольны. Спасибо, что рассказали, — мы обязательно разберёмся в ситуации.",
+                "Простите, что так получилось. Спасибо, что написали, мы передадим ваш отзыв и разберёмся."])))
+            self._run_terminal(chat_id, user_name, user_text, Reply(raw="ACTION: notify_manager", action="notify_manager"), res)
+            return res
+        if PRAISE_RE.search(t) and not COMPLAINT_RE.search(t) and not re.search(r"спасибо|рад|приятно", r):
+            return TurnResult([Message(self.rng.choice(["Спасибо за тёплый отзыв! Будем рады видеть вас снова в YUQI.",
+                                                        "Спасибо, очень приятно! Ждём вас снова в YUQI."]))], steps=out.steps)
+        for q_rx, must, answers in TOPIC_GUARD:
+            if q_rx.search(t) and not must.search(r):
+                return TurnResult([Message(self.rng.choice(answers))], steps=out.steps)
+        # вопросы о ресторане (часы, адрес, алкоголь, Wi-Fi, парковка, бонусы, доставка)
+        for (q_rx, answers), must in zip(FAQ_FALLBACK, FAQ_MUST):
+            if q_rx.search(t) and not must.search(r):
+                return TurnResult([Message(self.rng.choice(answers))], steps=out.steps)
+        if re.search(r"алкогол|вино|пиво|спиртн", t) and re.match(r"\s*да\b", r) and "нет" in r:
+            return TurnResult([Message(self.rng.choice(FAQ_FALLBACK[2][1]))], steps=out.steps)   # «Да, алкоголя нет»
+        return None
+
+    def _faq_fallback(self, user_text: str) -> Optional[str]:
+        t = norm(user_text)
+        for rx, answers in FAQ_FALLBACK:
+            if rx.search(t):
+                return self.rng.choice(answers)
+        return None
 
     async def _say(self, out: TurnResult, m: Message) -> None:
         if self._progress:

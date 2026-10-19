@@ -1,0 +1,6 @@
+# Для хостинга Amvera: PyTorch для процессора (в несколько раз меньше обычной сборки с CUDA)
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch
+python-telegram-bot[socks]>=21
+transformers
+sentencepiece
