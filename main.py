@@ -85,6 +85,16 @@ async def on_other(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_chat.send_message(NON_TEXT)
 
 
+async def on_stats(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """/stats — сколько ответов дала модель (текстом или через инструмент), а сколько — запасной ответ."""
+    if not ctx.application.bot_data.get("allow_reset"):
+        return
+    st = ctx.application.bot_data["orch"].stats
+    total = sum(st.values()) or 1
+    lines = [f"{k}: {v} ({v * 100 // total}%)" for k, v in st.most_common()]
+    await update.effective_chat.send_message("Кто отвечал с момента запуска:\n" + ("\n".join(lines) or "пока никто"))
+
+
 async def on_error(update: object, ctx: ContextTypes.DEFAULT_TYPE) -> None:
     if isinstance(ctx.error, NetworkError):                       # обрыв связи/таймаут/прокси: само переподключится, трейс не нужен
         log.warning("проблема с сетью (%s), пробую снова", type(ctx.error).__name__)
@@ -101,8 +111,7 @@ def main() -> None:
         download_model(os.environ["MODEL_URL"], model_dir, progress=False)
     llm = LLM.from_hf(model_dir)
     log.info("модель загружена: device=%s block_size=%s", llm.device, llm.block_size)
-    orch = Orchestrator(llm, BookingDB(os.environ.get("DB_PATH", "yuqi.db")),
-                        temperature=float(os.environ.get("TEMPERATURE", "0")))   # 0 — всегда одинаковые формулировки
+    orch = Orchestrator(llm, BookingDB(os.environ.get("DB_PATH", "yuqi.db")))
 
     async def post_init(a: Application) -> None:                  # подсказка команд в меню Telegram
         from telegram import BotCommand
@@ -120,6 +129,7 @@ def main() -> None:
     app.bot_data["allow_reset"] = os.environ.get("ALLOW_RESET", "1") != "0"
     app.add_handler(CommandHandler("start", on_start))
     app.add_handler(CommandHandler("reset", on_reset))
+    app.add_handler(CommandHandler("stats", on_stats))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(~filters.COMMAND, on_other))
     app.add_error_handler(on_error)

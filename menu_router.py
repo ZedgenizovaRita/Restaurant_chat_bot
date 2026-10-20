@@ -336,6 +336,58 @@ def _lunch_recommend(menu: Menu, rng, ctx: dict) -> list[str]:
     return msgs
 
 
+def is_followup(text: str, ctx: dict) -> bool:
+    """Реплика опирается на то, что код только что показал (список, блюдо, рекомендацию) — её сначала разбирает код."""
+    t = norm(text)
+    words = [w for w in t.split() if w not in ("а", "и", "но", "ну")]
+    if not words or not (ctx.get("fresh") or ctx.get("rec_fresh") or ctx.get("why") or ctx.get("topic")):
+        return False
+    if REF_RE.search(t) or words[0] in WHY_WORDS:
+        return True
+    if ctx.get("rec_fresh") and (MORE_RE.search(t) and len(words) <= 5 or detect_filter(text) and len(words) <= 7):
+        return True
+    if (PRONOUN_RE.search(t) or DEMO_RE.search(t)) and len(words) <= 7:
+        return True
+    if PRICE_RE.search(t) and len(words) <= 4:
+        return True
+    return len(words) <= 2 and bool(OPINION_RE.search(t))
+
+
+def expire(ctx: dict) -> None:
+    """Ход прошёл без кода меню — «свежесть» прошлого показа больше не действует."""
+    for k in ("fresh", "rec_fresh", "why", "topic"):
+        ctx.pop(k, None)
+
+
+def note_shown(ctx: dict, menu: Menu, *, category: Optional[str] = None, flt: Optional[str] = None,
+               item: Optional[str] = None, lunch: bool = False, text: str = "") -> None:
+    """Модель вызвала инструмент меню (или назвала блюда в ответе) — запоминаем, что гость увидел, для «оттуда», «а почему?», «он острый?»."""
+    expire(ctx)
+    if lunch:
+        ctx["topic"], ctx["lunch_names"] = "lunch", [i.name for i in menu.items if i.business_lunch]
+        return
+    items: list[Item] = []
+    if category and category not in ("all", "signature"):
+        items = [i for i in _regular(menu) if i.category == category]
+    elif category == "signature":
+        items = [i for i in _regular(menu) if i.signature]
+    elif flt:
+        items = _apply(_regular(menu), flt)
+    elif item:
+        items = find_items(item, menu)[:1]
+    elif text:                                                          # «Рекомендую «Филадельфия» и «Том Ям…»»
+        named = {norm(x) for x in re.findall(r"«([^»]+)»", text)}
+        items = [i for i in _regular(menu) if norm(i.name) in named or any(norm(a) in named for a in i.aliases)]
+        if not items:
+            items = [i for i in _regular(menu) if norm(i.name) in norm(text)]
+        if len(items) >= 2:                                              # это рекомендация — «давай другое» возьмёт другие блюда
+            ctx["rec"] = {"pool": [i.name for i in _regular(menu) if i.category not in ("drinks", "desserts")],
+                          "shown": [i.name for i in items], "flt": None}
+            ctx["rec_fresh"] = True
+    if items:
+        _remember(ctx, items, flt)
+
+
 def route(text: str, menu: Menu, rng: Optional[random.Random] = None, ctx: Optional[dict] = None) -> Optional[list[str]]:
     """ctx — память чата о последнем показанном списке {"names": [...], "flt": ...}; route обновляет её сам."""
     out = _route(text, menu, rng or random, ctx if ctx is not None else {})

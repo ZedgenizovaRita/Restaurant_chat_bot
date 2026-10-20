@@ -28,7 +28,7 @@ HELP = ("Примеры вопросов:\n"
         "  • Сколько стоит бизнес-ланч? / До скольки вы работаете? / Где вы находитесь?\n"
         "  • Хочу столик на завтра в 19:00 на двоих / Отмени мою бронь\n"
         "  • Отзыв: «Было очень вкусно, спасибо!»\n"
-        "Команды: /reset — начать заново, /exit — выход.")
+        "Команды: /reset — начать заново, /stats — сколько ответов дала модель, а сколько — запасной ответ, /exit — выход.")
 
 # ---------------------------------------------------------------- оформление вывода
 if os.name == "nt":
@@ -93,6 +93,9 @@ async def main(a) -> None:
         cmd = text.lower()
         if cmd in ("/exit", "/quit", "выход"):
             break
+        if cmd == "/stats":
+            print(f"{DIM}кто отвечал: {dict(orch.stats) or 'пока никто'}{RESET}")
+            continue
         if cmd in ("/help", "помощь"):
             print(HELP)
             continue
@@ -108,6 +111,7 @@ async def main(a) -> None:
         r = await orch.handle_text(1, text, "Гость", progress)
         print(" " * 20, end="\r")
         if a.debug:
+            print(f"{DIM}  [источник ответа: {r.source}]{RESET}")
             for s in r.steps:
                 print(f"{DIM}  [модель, logprob {s['logprob']}] {s['raw']}{RESET}")
         for m in r.messages:

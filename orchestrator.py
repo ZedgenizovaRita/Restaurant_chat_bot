@@ -1,38 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-orchestrator.py — сердце бота. Цикл «модель -> действие -> инструмент -> модель».
+orchestrator.py — агентный цикл бота
 
-    result = await orch.handle_text(chat_id, "Хочу столик на двоих завтра в 19:00, Рита", user_name="Рита")
-    for m in result.messages: ...отправить m.text (m.html -> parse_mode="HTML")
-    for n in result.notices:  ...отправить n.text администратору
+Один ход:
+  1. Реплика гостя добавляется в историю диалога (формат датасета: «User: … -> Bot:»).
+  2. Модель пишет ответ: текст и/или команду ACTION (protocol.py).
+  3. Код проверяет только форму: ответ не оборван, команда существует и с верными параметрами,
+     модель уверена (средняя log-вероятность). Иначе — честное «не понял».
+  4. Команды с результатом (инструменты брони) код выполняет и возвращает модели «Tool: RESULT: …»,
+     модель продолжает. Конечные команды (меню, фильтр, цена, бизнес-ланчи, notify_manager)
+     код выполняет и показывает гостю.
 
-Бот работает только текстом: никаких форм и кнопок. Все диалоги — как в датасете v5.
+Инструменты:
+  call_date_agent(EXPRESSION)                 -> ДД.ММ.ГГГГ               «завтра», «в пятницу» -> дата
+  call_booking_time_agent(DATE,TIME,…)        -> time_valid | invalid_time
+  call_free_tables_agent(DATE,TIME,GUESTS,…)  -> available | unavailable | active_booking_exists
+  book_table(DATE,TIME,GUESTS,NAME)           -> booked | table_busy      база заново проверяет всё сама
+  check_active_booking / cancel_booking       -> бронь гостя / cancelled
+  show_menu, call_menu_filter_agent, call_price_agent, show_business_lunch — данные только из menu.json
 
-Как идёт один ход:
-  1. реплика пользователя очищается (sanitize_user_text) и добавляется в историю;
-  2. модель генерирует ответ; он проверяется: не оборван, действие корректно (validate_action),
-     модель уверена (mean_logprob >= min_logprob). Иначе — запасной ответ и сброс диалога:
-     лучше честно «не понял», чем выполнить выдуманное;
-  3. без действия — обычный текст. Если бот в нём что-то спросил, диалог остаётся открытым;
-  4. «инструменты с результатом» (TOOLS_WITH_RESULT) код выполняет сам и отдаёт модели
-     "Tool: RESULT: ..." — модель продолжает. Служебные реплики модели между шагами
-     («Проверяю время.») пользователю не показываются, он видит только итог;
-  5. остальные действия конечные: меню, бизнес-ланч, фильтры, цена, notify_manager.
-
-Цепочка брони (каждый шаг — результат кода, а не выдумка модели):
-  call_date_agent -> дата ДД.ММ.ГГГГ
-  call_booking_time_agent -> time_valid | invalid_time | REASON: outside_hours / past_time
-  call_free_tables_agent -> available | unavailable | active_booking_exists | ...
-  book_table -> booked | table_busy
-Отмена: check_active_booking -> active_booking | ... / no_active_booking; cancel_booking -> cancelled.
-Перед book_table и cancel_booking код проверяет всё заново — выдуманной моделью брони не будет.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import logging
-import difflib
-import html
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -41,83 +33,39 @@ from typing import Callable, Optional
 from dates import moscow_now, resolve_date, validate_booking_date
 from db import BookingDB, check_slot
 from llm import GenResult, PromptTooLong
-from menu import Menu, get_menu, tool_filter, tool_price, tool_show_business_lunch, tool_show_menu
-import random
-
-import menu_router
-import slots as slotlib
-from db import MAX_GUESTS_PER_BOOKING
-from intents import (FILTER_WORDS_RE, has_booking_words, is_abort, is_booking_request, is_cancel_intent, is_no, is_yes,
-                     looks_like_business_lunch, looks_like_menu, norm, ungrounded)
-from protocol import (ARROW, DialogHistory, Reply, TOOLS_WITH_RESULT, expects_answer, parse_reply,
-                      sanitize_user_text, validate_action)
+from menu import Menu, find_items, fmt_price, get_menu, tool_filter, tool_price, tool_show_business_lunch, tool_show_menu
+from slots import extract as extract_slots
+from protocol import DialogHistory, Reply, TOOLS_WITH_RESULT, expects_answer, parse_reply, sanitize_user_text, validate_action
 
 log = logging.getLogger("yuqi.orchestrator")
+BOOKING_TOOLS = {"call_date_agent", "call_booking_time_agent", "call_free_tables_agent", "book_table"}
 
-FAQ_FALLBACK = [   # запасные ответы на вопросы про ресторан, если модель не справилась (факты те же, что в датасете)
-    (re.compile(r"до скольки|врем\w* работы|час\w* работы|режим|график|во сколько (?:откр|закр)|когда (?:откр|закр)|работаете|открыты|открываетесь|закрываетесь"),
-     ["Мы открыты каждый день с 10:00 до 23:00. По будням с 12:00 до 16:00 у нас ещё действуют бизнес-ланчи.",
-      "YUQI работает ежедневно с 10:00 до 23:00, а бизнес-ланчи подаём по будням с 12:00 до 16:00."]),
-    (re.compile(r"адрес|где (?:вы )?(?:находитесь|расположен|находится)|как (?:до вас )?добрать|как вас найти|где ресторан|местоположение|дорог"),
-     ["Мы находимся в Москве, на Большой Никитской, 24/1. Адрес можно ввести в любое приложение с картами.",
-      "Ждём вас по адресу: Москва, ул. Большая Никитская, 24/1."]),
-    (re.compile(r"алкогол|вино|пиво|виски|коктейл|шампанск|спиртн"),
-     ["К сожалению, алкогольных напитков в ресторане нет, зато есть лимонад юдзу, матча латте и кофе.", "Нет, алкоголя у нас нет — из напитков есть лимонад юдзу, матча латте и американо."]),
-    (re.compile(r"бонус|накопительн|программ\w* лояльн|кэшбэк|кешбэк|карт\w* лояльн"),
-     ["Бонусной системы у нас пока нет. Если появятся вопросы по меню или брони — с радостью помогу."]),
-    (re.compile(r"wi.?fi|вайфай|вай-фай|интернет"), ["Да, для гостей ресторана есть бесплатный Wi-Fi."]),
-    (re.compile(r"парковк|машин"), ["Да, рядом с рестораном есть бесплатная парковка."]),
-    (re.compile(r"достав|самовывоз|навынос|с собой|оформи\w* заказ"),
-     ["Заказы на самовывоз и доставку здесь не оформляются, но я могу показать меню, подсказать состав и цену блюд или забронировать столик."]),
-]
-GENERIC_RE = re.compile(r"чем могу помочь|чем могу быть полезен|чем вам помочь")   # приветствие/«что умею»: не держим в истории
-TOPIC_GUARD = [   # (вопрос гостя, что обязано быть в ответе модели, запасные ответы) — модель ответила не на тот вопрос -> ответ кода
-    (re.compile(r"^(?:ну |а |и )?(?:привет\w*|здравствуй\w*|здрасте|добрый (?:день|вечер)|доброе утро|хай|hello|hi|ку)\W*$|что (?:ты )?(?:умеешь|можешь)|чем (?:ты )?(?:можешь )?помочь|кто ты|ты бот|ты робот"),
-     re.compile(r"помощник|помогу|подскажу|расскажу|умею"),
-     ["Здравствуйте! Я помощник ресторана YUQI: подскажу по меню, ценам и составу блюд, бизнес-ланчам, адресу и часам работы, помогу забронировать или отменить столик. Чем могу помочь?"]),
-    (re.compile(r"собак|кошк|животн|питом|с детьми|с ребенк|с ребёнк|детск\w* (?:меню|стул)|веранд|живая музык|кальян|курить|курение|караоке|банкет|дресс"),
-     re.compile(r"информац|не могу подсказать|подсказать не могу|уточн"),
-     ["К сожалению, точной информации об этом у меня нет. Могу рассказать про меню или помочь забронировать столик.",
-      "Об этом, увы, подсказать не могу — такой информации у меня нет. Зато с меню и бронью помогу с радостью."]),
-]
-COMPLAINT_RE = re.compile(r"не понравил|ужасн|отвратит|невкусн|плох\w* (?:обслуж|еда|сервис)|хамств|нагруб|грязн|долго ждал|холодн\w* (?:суп|блюд|еда)|разочарован|отравил|недовол")
-PRAISE_RE = re.compile(r"(?<!не )понравил|было (?:очень )?вкусно|спасибо за (?:вечер|ужин|обед)|всё супер|все супер|отличн\w* (?:место|кухня|ресторан)|вернёмся|вернемся")
-FAQ_MUST = [re.compile(r"\d{1,2}:\d{2}|кругл|без выходн"), re.compile(r"никитск|24/1|адрес"), re.compile(r"алкогол|не подаём|не подаем|нет"),
-            re.compile(r"бонус|программ|лояльн|накопит"), re.compile(r"wi.?fi|вайфай|интернет"), re.compile(r"парковк"),
-            re.compile(r"достав|самовывоз|навынос|в зале|с собой|заказ")]
-MENU_ACTIONS = {"show_menu", "call_menu_filter_agent", "show_business_lunch"}
-MENU_INTROS = ["Конечно, вот что у нас есть:", "С удовольствием! Смотрите:", "Давайте посмотрим, что нашлось:"]
-RECENT_EXCHANGES = 2        # сколько последних обменов «вопрос-ответ» передаётся модели как контекст
 FALLBACK_TEXT = ("Извините, я вас не понял. Я могу рассказать про меню, цены, бизнес-ланчи, адрес и часы работы, "
                  "а также забронировать столик. Попробуйте, пожалуйста, переформулировать.")
-RESET_TEXT = "Давайте начнём сначала. Чем могу помочь?"
-EMPTY_TEXT = "Напишите, пожалуйста, ваш вопрос текстом."
-BAD_DATE_TEXT = "Не удалось понять дату. Напишите её, пожалуйста, например: 25 октября."
-BUSY_TEXT = "Бронь сейчас оформить не получилось. Напишите, пожалуйста, ещё раз."
-TOOL_FAIL_TEXT = "Что-то пошло не так. Напишите, пожалуйста, ещё раз."
-ASK = {"date": "на какую дату", "time": "на какое точное время", "guests": "сколько человек будет", "name": "на чьё имя оформить бронь"}
-NO_ACTIVE_TEXT = "У вас нет активных броней, отменять нечего. Если хотите, помогу забронировать столик."
-KEEP_TEXT = "Хорошо, бронь остаётся без изменений."
-DECLINE_BOOK_TEXT = ("Хорошо, ничего не бронирую. Если хотите изменить данные, напишите дату, время, "
-                     "количество человек и имя заново.")
-# модель просит данные брони (а не просто упоминает, что умеет бронировать)
-BOOKING_ASK_RE = re.compile(r"на какую дату|на какое (точное )?время|сколько (человек|вас)|на чьё имя|имя для брони|дату, (точное )?время")
-SCHED = "с понедельника по пятницу с 12:00 до 16:00"
-BOOKING_ACTIONS = {"call_date_agent", "call_booking_time_agent", "call_free_tables_agent", "book_table",
-                   "check_active_booking", "cancel_booking"}
-BOOKING_PARAM_ACTIONS = {"call_booking_time_agent", "call_free_tables_agent", "book_table"}
-EARLY_RE = re.compile(r"дата — (\d{2}\.\d{2}\.\d{4}), время — (\d{2}:\d{2})")
-
-
-def people_word(n: int) -> str:
-    return "человека" if (n % 10 in (1, 2, 3, 4) and n % 100 not in (11, 12, 13, 14)) else "человек"
+BAD_DATE_TEXT = "Не удалось понять дату. Напишите её, пожалуйста, например: 25 октября."    # так же в датасете
+BOOKING_WORDS = re.compile(r"брон|стол|запи[сш]|посидеть|резерв")
+FIELDS = (("DATE", "date", "на какую дату", "дата"), ("TIME", "time", "на какое время", "время"),
+          ("GUESTS", "guests", "сколько человек будет", "гостей"), ("NAME", "name", "на чьё имя оформить бронь", "имя"))
+NEED = {"call_booking_time_agent": ("DATE", "TIME"), "call_free_tables_agent": ("DATE", "TIME", "GUESTS"),
+        "book_table": ("DATE", "TIME", "GUESTS", "NAME")}
+CLAIM_BOOKED = re.compile(r"бронь (?:подтвержден|оформлен|создан)|столик забронирован|забронировал[аи]? (?:для вас|столик)")
+CLAIM_CANCELLED = re.compile(r"бронь (?:отменен|отменён|снят)")
+CLAIM_EXISTS = re.compile(r"у вас (?:уже )?есть (?:активная )?бронь")
+TIME_SAID = re.compile(r"\d{1,2}:\d{2}|(?<![\w])(?:в|к|на|до)\s+\d{1,2}(?![\d:.\-/])(?!\s*(?:человек|чел|гост|персон|янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек))"
+                       r"|утра|вечера|часов|час(?:а|у)?\b|полдень|полноч")
+OK_LEAD = {"готово", "отлично", "конечно", "хорошо", "спасибо", "супер", "замечательно", "прекрасно", "всё", "все", "итак",
+           "принято", "понял", "записал", "увы", "к", "извините", "простите", "да", "нет", "сейчас", "секунду", "минутку"}
+YES = ("да", "ага", "угу", "конечно", "подтверждаю", "верно", "давай", "давайте", "ок", "окей")
+KEEP_EXCHANGES = 2          # после завершённого ответа модель видит 2 прошлых обмена (если контекст ей помогает, см. _turn)
+WEEKDAYS = {"понедельник": 1, "вторник": 1, "сред": 1, "четверг": 1, "пятниц": 1, "суббот": 0, "воскресен": 0, "выходн": 0, "будн": 1}
+LUNCH_SCHED = "с понедельника по пятницу с 12:00 до 16:00"
 
 
 def booking_line(d: str, t: str, g: int, n: str) -> str:
-    return f"{d}, {t}, {g} {people_word(g)}, имя {n}"
+    w = "человека" if g % 10 in (2, 3, 4) and g % 100 not in (12, 13, 14) else "человек"
+    return f"{d}, {t}, {g} {w}, имя {n}"
 
 
-# ---------------------------------------------------------------- что возвращаем Telegram-слою
 @dataclass
 class Message:
     text: str
@@ -129,7 +77,7 @@ class ManagerNotice:
     """Тихое уведомление администратору (жалоба в отзыве). Гость его не видит."""
     chat_id: int
     user_name: Optional[str]
-    text: str                     # текст отзыва
+    text: str
 
 
 @dataclass
@@ -137,7 +85,7 @@ class TurnResult:
     messages: list[Message] = field(default_factory=list)
     notices: list[ManagerNotice] = field(default_factory=list)
     steps: list[dict] = field(default_factory=list)   # отладка: что генерировала модель
-    rejected: bool = False                            # ответ модели не годился, сработал запасной вариант
+    source: str = ""                                  # «модель», «модель + инструмент», «запасной ответ»
 
 
 @dataclass
@@ -145,76 +93,58 @@ class Session:
     history: DialogHistory = field(default_factory=DialogHistory)
     last_active: Optional[datetime] = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
-    cancel_armed: bool = False     # бот уже показал гостю его бронь -> можно отменять после «да»
-    user_texts: list = field(default_factory=list)       # реплики гостя в текущем диалоге
-    known_dates: set = field(default_factory=set)        # даты, которые вернул call_date_agent
-    booking: Optional[dict] = None                       # проверенные параметры брони (DATE, TIME, GUESTS, NAME)
-    pending_book: Optional[dict] = None                  # ждём «да» перед бронированием
-    pending_cancel: Optional[dict] = None                # ждём «да» перед отменой {"booking", "then_book", "resume_text"}
-    in_booking: bool = False                             # диалог о брони уже идёт
-    active_checked: bool = False                         # наличие активной брони уже проверяли в этом диалоге
-    bk: Optional[dict] = None                            # бронь, которую ведёт код: {"slots": {...}, "stage": collect|confirm}
-    faq_only: bool = False                               # временная сессия для ответа на вопрос посреди брони
-    offered_booking: bool = False                        # последний ответ модели предлагал забронировать
-    recent: list = field(default_factory=list)           # последние RECENT_EXCHANGES завершённых обменов «User: … -> Bot: …» — контекст для модели
-    recent_full: list = field(default_factory=list)      # те же обмены целиком (user, bot) — для проверки «модель повторила прошлый ответ»
-    menu_ctx: dict = field(default_factory=dict)         # последний показанный список блюд («посоветуйте оттуда»); /reset стирает вместе с сессией
-
-    def forget_recent(self) -> None:
-        self.recent.clear()
-        self.recent_full.clear()
+    cancel_armed: bool = False      # бот показал гостю его бронь -> cancel_booking разрешён
+    cancelled: object = None        # только что отменённая бронь (для сверки слов модели)
+    prev_raws: set = field(default_factory=set)      # что модель сгенерировала в прошлый ход (ловим повторы)
+    prev_user: str = ""
+    prev_msgs: list = field(default_factory=list)    # что бот отправил в прошлый ход
+    used_ctx: bool = False
+    pending_book: Optional[dict] = None   # модель хочет book_table — ждём «да» (или имя) от гостя
+    slots: dict = field(default_factory=dict)       # дата/время/гости/имя, найденные КОДОМ в словах гостя
+    last_slots: dict = field(default_factory=dict)  # то же только из последней реплики
+    booking_ok: bool = False        # гость действительно говорит о брони (проверено один раз за разговор)
+    ctx_closed: bool = False        # прошлый вопрос закрыт: контекст — только подсказка, модель может начать с чистого листа
+    user_texts: list = field(default_factory=list)   # реплики гостя в текущем разговоре (проверка имени и числа гостей)
 
     def reset(self) -> None:
         self.history.reset()
         self.cancel_armed = False
-        self.user_texts, self.known_dates = [], set()
-        self.booking = self.pending_book = self.pending_cancel = None
-        self.in_booking = self.active_checked = False
-        self.bk, self.offered_booking = None, False
+        self.pending_book = None
+        self.slots, self.last_slots = {}, {}
+        self.booking_ok = False
+        self.ctx_closed = False
+        self.user_texts = []
+
+    def close_dialog(self) -> None:
+        """Вопрос закрыт: в истории остаются только последние KEEP_EXCHANGES обменов (контекст для «а в выходные?»)."""
+        segs, starts = self.history.done, [i for i, s in enumerate(self.history.done) if s.startswith("User:")]
+        self.history.done = [] if not KEEP_EXCHANGES else segs[starts[-KEEP_EXCHANGES]:] if len(starts) >= KEEP_EXCHANGES else segs[:]
+        self.ctx_closed = True
+        self.slots = {}
 
 
 class Orchestrator:
-    def __init__(self, llm, booking_db: BookingDB, *, menu: Optional[Menu] = None,
-                 min_logprob: Optional[float] = -1.5, session_ttl_min: int = 30,
-                 max_tool_steps: int = 6, confirm_booking: bool = True, code_cancel: bool = True,
-                 grounding: bool = True, show_progress: bool = True, code_booking: bool = True,
-                 code_menu: bool = True, rng: Optional[random.Random] = None, temperature: float = 0.0,
-                 now_fn: Callable[[], datetime] = moscow_now) -> None:
-        """
-        llm          — объект с async agenerate(prompt) -> GenResult (llm.LLM)
-        confirm_booking — перед бронью код сам просит гостя написать «да» (модель при этом не нужна)
-        code_cancel  — отмена брони и «у вас уже есть бронь» ведёт код, а не модель
-        grounding    — имя, число гостей и время в брони должны быть в словах гостя (иначе код переспрашивает)
-        code_menu    — вопросы про меню (фильтры, рекомендации, «какие есть удоны», состав, цена) отвечает код по menu.json
-        code_booking — сбор брони (дата, время, гости, имя) ведёт код, а не модель: исправления гостя всегда перезаписывают старое
-        show_progress — показывать служебные фразы модели («Проверяю время.»)
-        temperature  — свобода формулировок: >0 — обычный текстовый ответ (не команда) генерируется заново с этой температурой;
-                       цифры (время, цены, адрес) должны остаться как в базовом ответе, иначе берётся базовый. 0 — отключено.
-        min_logprob  — порог уверенности модели (средняя log-вероятность токенов ответа);
-                       ниже порога -> запасной ответ. None отключает проверку. Подберите на своих данных.
-        """
+    def __init__(self, llm, booking_db: BookingDB, *, menu: Optional[Menu] = None, min_logprob: Optional[float] = -1.5,
+                 session_ttl_min: int = 30, max_tool_steps: int = 6, now_fn: Callable[[], datetime] = moscow_now,
+                 confirm_booking: bool = True, grounding: bool = True, context_choice: bool = True, **_old_flags) -> None:
+        """llm — объект с async agenerate(prompt) -> GenResult (llm.LLM).
+        min_logprob — порог уверенности модели; ниже -> «не понял». None отключает проверку.
+        confirm_booking — перед записью брони гость подтверждает данные «да».
+        grounding — проверки брони кодом (имя из слов гостя, бронь только по просьбе, сверка слов модели с базой)."""
         self.llm, self.db, self.menu = llm, booking_db, menu
+        self.confirm_booking, self.grounding, self.context_choice = confirm_booking, grounding, context_choice
         self.min_logprob, self.ttl_min, self.max_tool_steps, self.now = min_logprob, session_ttl_min, max_tool_steps, now_fn
-        self.confirm_booking, self.code_cancel, self.grounding, self.show_progress = confirm_booking, code_cancel, grounding, show_progress
-        self.code_booking, self.temperature = code_booking, temperature
-        self.code_menu, self.rng = code_menu, rng or random.Random()
         self._sessions: dict[int, Session] = {}
-        self._progress = None
+        self.stats = collections.Counter()           # сколько ответов дала модель, а сколько — запасной ответ
 
     # ------------------------------------------------------------ сессии
     def _session(self, chat_id: int) -> Session:
-        now = self.now()
-        for cid in [c for c, s in self._sessions.items()                # чистим давно ушедших
-                    if s.last_active and (now - s.last_active).total_seconds() > self.ttl_min * 120]:
-            if not self._sessions[cid].lock.locked():
-                del self._sessions[cid]
         return self._sessions.setdefault(chat_id, Session())
 
     def reset(self, chat_id: int) -> None:
-        """Сбросить диалог (например, по команде /start)."""
+        """Сбросить диалог (команда /start)."""
         if chat_id in self._sessions:
             self._sessions[chat_id].reset()
-            self._sessions[chat_id].forget_recent()
 
     def wipe(self, chat_id: int) -> tuple[int, int]:
         """/reset для тестов: забыть диалог и стереть брони и отзывы этого чата. -> (броней, отзывов)."""
@@ -224,7 +154,372 @@ class Orchestrator:
     def _menu(self) -> Menu:
         return self.menu or get_menu()
 
-    # ------------------------------------------------------------ проверка ответа модели
+    # ------------------------------------------------------------ главный вход
+    async def handle_text(self, chat_id: int, text: str, user_name: Optional[str] = None, on_progress=None) -> TurnResult:
+        """on_progress — async-функция(Message): реплики модели перед инструментом («Проверяю время.») уходят гостю сразу."""
+        sess = self._session(chat_id)
+        async with sess.lock:                                            # сообщения одного чата — по очереди
+            now = self.now()
+            if sess.last_active and (now - sess.last_active).total_seconds() > self.ttl_min * 60:
+                sess.reset()                                             # диалог «остыл»
+            sess.last_active = now
+            clean = sanitize_user_text(text) or "?"
+            sess.user_texts = (sess.user_texts + [clean])[-8:]
+            expecting = self._expecting(sess)
+            sess.last_slots = extract_slots(clean, now.date(), expecting)
+            if expecting != "time" and not TIME_SAID.search(clean.lower()):
+                sess.last_slots.pop("time", None)                        # «нас будет 4» — это гости, а не 16:00
+            if len(sess.last_slots.get("name", "")) < 3:
+                sess.last_slots.pop("name", None)                        # «Не», «Да» — не имена
+            sess.slots.update(sess.last_slots)
+            if sess.pending_book:
+                res = await self._confirm(chat_id, sess, clean, user_name, on_progress)
+            else:
+                res = await self._turn(chat_id, sess, clean, user_name, on_progress)
+            if self.grounding:
+                await self._check_facts(chat_id, sess, res)
+                await self._check_claims(chat_id, res)
+            texts = [m.text for m in res.messages]
+            shown = [m.text for m in res.messages if m.html] or texts      # для меню сравниваем сами списки блюд
+            if shown and shown == sess.prev_msgs and sess.used_ctx and clean.lower() != sess.prev_user and texts != [FALLBACK_TEXT] \
+                    and not res.source.startswith("код"):                # ответ из базы повторять можно
+                log.warning("chat=%s: бот повторил прошлое сообщение на другой вопрос -> «не понял»", chat_id)
+                sess.reset()                                             # одно и то же дважды подряд не отправляем
+                res = TurnResult([Message(FALLBACK_TEXT)], steps=res.steps, source="запасной ответ")
+                shown = [FALLBACK_TEXT]
+            sess.prev_msgs = shown
+            sess.prev_raws, sess.prev_user = {st["raw"].strip() for st in res.steps if st.get("raw")}, clean.lower()
+            self.stats[res.source] += 1
+            log.info("chat=%s источник ответа: %s", chat_id, res.source)
+            return res
+
+    async def _turn(self, chat_id: int, sess: Session, user_text: str, user_name: Optional[str], on_progress) -> TurnResult:
+        h, first = sess.history, None
+        prompt = h.prompt_for_user(user_text)
+        if self.context_choice and sess.ctx_closed and h.done:
+            # Новый вопрос после закрытого: модель отвечает дважды — с прошлым контекстом и без него, — берём ответ,
+            # в котором она увереннее. «А сколько стоит?» без контекста непонятен, а «Скинь меню» контекст только сбивает.
+            try:
+                with_ctx = await self.llm.agenerate(prompt)
+                saved, h.done = h.done, []
+                fresh_prompt = h.prompt_for_user(user_text)
+                fresh = await self.llm.agenerate(fresh_prompt)
+            except PromptTooLong:
+                saved, with_ctx, fresh = [], None, None
+                fresh_prompt = h.prompt_for_user(user_text)
+            if with_ctx and self._score(with_ctx, sess, user_text, ctx=True) > self._score(fresh, sess, user_text):
+                h.done, first = saved, with_ctx
+                h.prompt_for_user(user_text)
+            else:
+                prompt, first = fresh_prompt, fresh
+                sess.user_texts, sess.booking_ok, sess.slots = [user_text], False, dict(sess.last_slots)
+        sess.ctx_closed = False
+        sess.used_ctx = bool(h.done)                 # модель видела прошлые реплики (только тогда повтор — подозрителен)
+        return await self._loop(chat_id, sess, user_text, user_name, on_progress, prompt, TurnResult(source="модель"), first)
+
+    def _score(self, gen: Optional[GenResult], sess: Session, user_text: str, ctx: bool = False) -> float:
+        if gen is None:
+            return float("-inf")
+        r = parse_reply(gen.text)
+        if ctx and r.raw.strip() in sess.prev_raws and user_text.lower() != sess.prev_user:
+            return float("-inf")    # с контекстом модель повторила прошлый ответ на другой вопрос («А есть харчо?» -> снова удон)
+        if self._problem(gen, r) or (self.grounding and r.action in BOOKING_TOOLS and not self._booking_wanted(sess)) \
+                or (r.action == "cancel_booking" and not sess.cancel_armed) \
+                or (r.action == "call_price_agent" and not self._item_said(sess.user_texts if ctx else [user_text], r.params["ITEM"])):
+            return float("-inf")
+        return gen.mean_logprob
+
+    async def _loop(self, chat_id: int, sess: Session, user_text: str, user_name: Optional[str], on_progress,
+                    prompt: str, out: TurnResult, first: Optional[GenResult] = None) -> TurnResult:
+        h = sess.history
+        for _ in range(self.max_tool_steps + 1):
+            try:
+                gen: GenResult = first or await self.llm.agenerate(prompt)
+                first = None
+            except PromptTooLong:
+                return self._fallback(sess, out, "слишком длинный диалог")
+            reply = parse_reply(gen.text)
+            out.steps.append({"prompt": prompt, "raw": reply.raw, "logprob": round(gen.mean_logprob, 3), "action": reply.action})
+            problem = self._problem(gen, reply)
+            if problem:
+                return self._fallback(sess, out, f"chat={chat_id}: {problem} | raw={reply.raw!r}")
+
+            # --- просто текст
+            if not reply.has_action:
+                text = reply.text
+                if "Продолжим бронь" in text and not h.done:
+                    text = text.split("Продолжим бронь")[0].strip() or text   # модель «вспомнила» бронь, которой нет
+                text = self._lunch_day(user_text, text)
+                if "не по теме" in text:
+                    text = self._dish_on_menu(user_text) or re.sub(r"^Да, это", "Извините, это", text)             # «А у вас есть фунчоза?» — блюдо есть в меню
+                if self.grounding and re.match(r"(Понял|Записал|Принял):", text) and not self._ack_ok(sess, text):
+                    text = self._ask_missing(sess, [f[0] for f in FIELDS if f[1] not in sess.slots]) or text   # не верим цифрам модели
+                out.messages.append(Message(text))
+                h.commit(reply.raw)
+                if not expects_answer(reply):
+                    sess.close_dialog()
+                return out
+
+            out.source = "модель + инструмент"
+            # --- инструмент с результатом: код выполняет, модель продолжает
+            if self.grounding and reply.action in BOOKING_TOOLS:
+                if not self._booking_wanted(sess):
+                    return self._fallback(sess, out, f"chat={chat_id}: модель начала бронь без просьбы гостя: {reply.raw!r}")
+                sess.booking_ok = True
+                missing = self._ground(sess, reply)                      # факты брони — только из слов гостя
+                if missing:
+                    ask = self._ask_missing(sess, missing)
+                    out.messages.append(Message(ask))
+                    h.commit(ask)
+                    return out
+            if reply.action == "book_table" and self.confirm_booking:      # записывает бронь только после «да» гостя
+                h.commit(reply.raw)
+                return self._ask_confirm(sess, dict(reply.params), out)
+            if reply.action in TOOLS_WITH_RESULT:
+                if reply.text:                                           # «Проверяю время.» — сразу, до выполнения
+                    if on_progress:
+                        await on_progress(Message(reply.text))
+                    else:
+                        out.messages.append(Message(reply.text))
+                try:
+                    result, direct_text = await self._run_tool(chat_id, sess, reply)
+                except Exception:
+                    log.exception("chat=%s: инструмент %s упал", chat_id, reply.action)
+                    return self._fallback(sess, out, "инструмент упал")
+                if direct_text:                                          # код сам объясняет гостю (дата не понята и т.п.)
+                    out.messages.append(Message(direct_text))
+                    h.commit(direct_text)
+                    if not expects_answer(Reply(raw=direct_text, text=direct_text)):
+                        sess.close_dialog()
+                    return out
+                h.commit(reply.raw)
+                out.steps[-1]["result"] = result
+                prompt = h.prompt_for_tool(result)
+                continue
+
+            # --- конечное действие: меню, фильтр, цена, бизнес-ланчи, жалоба администратору
+            if reply.action == "call_menu_filter_agent" and reply.params["FILTER"] == "spicy" \
+                    and re.search(r"не\s*остр", f"{user_text} {reply.text}".lower()):
+                reply.params["FILTER"] = "not_spicy"                     # «А неострые?» — модель написала «Неострые…», а команду перепутала
+                reply.raw = reply.raw.replace("FILTER: spicy", "FILTER: not_spicy")
+            if reply.action == "call_price_agent" and not self._item_said(sess.user_texts, reply.params["ITEM"]):
+                return self._fallback(sess, out, f"chat={chat_id}: блюдо {reply.params['ITEM']!r} гость не называл")
+            if reply.action == "call_menu_filter_agent":
+                reply.params["FILTER"] = self._spicy_filter(user_text, reply)
+            if reply.text:
+                out.messages.append(Message(reply.text))
+            self._run_terminal(chat_id, user_name, user_text, reply, out)
+            h.commit(reply.raw)
+            sess.close_dialog()
+            return out
+
+        return self._fallback(sess, out, f"chat={chat_id}: слишком много шагов инструментов")
+
+    @staticmethod
+    def _fallback(sess: Session, out: TurnResult, why: str) -> TurnResult:
+        log.warning(why)
+        sess.reset()
+        return TurnResult([Message(FALLBACK_TEXT)], steps=out.steps, source="запасной ответ")
+
+    # ------------------------------------------------------------ бронь под защитой кода
+    def _ask_confirm(self, sess: Session, p: dict, out: TurnResult) -> TurnResult:
+        sess.pending_book = p
+        out.messages.append(Message(f"Проверьте, пожалуйста: {booking_line(p['DATE'], p['TIME'], int(p['GUESTS']), p['NAME'])}. "
+                                    "Подтверждаете бронь? Напишите «да» или «нет»."))
+        return out
+
+    async def _confirm(self, chat_id: int, sess: Session, text: str, user_name, on_progress) -> TurnResult:
+        """Ответ на «Подтверждаете бронь?»: «да» — код пишет бронь в базу, итог по результату пишет модель."""
+        p, sess.pending_book = sess.pending_book, None
+        words = text.lower().replace(",", " ").replace("!", " ").replace(".", " ").split()
+        if not (words and words[0] in YES):                              # не подтвердил — бронь не пишем, разговор с начала
+            sess.reset()
+            if words and words[0] in ("нет", "не", "неа"):
+                return TurnResult([Message("Хорошо, бронь не оформляю. Напишите, на какую дату, время и сколько гостей — "
+                                           "и я проверю ещё раз.")], source="код: бронь")
+            return await self._turn(chat_id, sess, text, user_name, on_progress)
+        return await self._book(chat_id, sess, p, text, user_name, on_progress, TurnResult(source="модель + инструмент"))
+
+    async def _book(self, chat_id: int, sess: Session, p: dict, text: str, user_name, on_progress, out: TurnResult) -> TurnResult:
+        """Запись в базу (база сама заново проверяет время и столы); итог по результату пишет модель."""
+        result, direct_text = await self._run_tool(chat_id, sess, Reply(raw="", action="book_table", params=p))
+        if direct_text:
+            sess.reset()
+            return TurnResult([Message(direct_text)], source="код: бронь")
+        out.steps.append({"action": "book_table", "result": result, "raw": "(подтверждено гостем)"})
+        return await self._loop(chat_id, sess, text, user_name, on_progress, sess.history.prompt_for_tool(result), out)
+
+    @staticmethod
+    def _spicy_filter(user_text: str, reply: Reply) -> str:
+        """«Какие блюда НЕ острые?» — модель путает spicy и not_spicy; отрицание в словах гостя (или в её же тексте) решает код."""
+        f = reply.params["FILTER"]
+        if f not in ("spicy", "not_spicy"):
+            return f
+        t = (user_text + " " + reply.text).lower()
+        neg = re.search(r"не\s*остр|без\s+остр|не\s+сильно\s+остр|мягк", t)
+        return "not_spicy" if neg else "spicy" if "остр" in user_text.lower() else f
+
+    @staticmethod
+    def _item_said(texts: list, item: str) -> bool:
+        """Цену какого блюда спрашивают — гость должен был назвать это блюдо (сейчас или в прошлом вопросе)."""
+        said = " ".join(texts).lower().replace("ё", "е")
+        words = [w for w in re.findall(r"[а-яёa-z]{3,}", item.lower().replace("ё", "е"))]
+        return not words or any(w[:4] in said for w in words)
+
+    def _booking_wanted(self, sess: Session) -> bool:
+        """Гость сам говорит о брони: слова «бронь/столик/записаться» или хотя бы две детали (дата, время, гости, имя)."""
+        last = sess.user_texts[-1] if sess.user_texts else ""
+        return (sess.booking_ok or bool(BOOKING_WORDS.search(" ".join(sess.user_texts).lower())) or len(sess.slots) >= 2
+                or ("date" in sess.last_slots and "?" not in last and len(last.split()) <= 3))     # «25 октября»
+
+    def _ground(self, sess: Session, reply: Reply) -> list[str]:
+        """Подставляет в команду модели дату/время/гостей/имя из слов гостя (их нашёл код).
+        Возвращает поля, которых гость ещё не назвал, — их бот спросит, а не придумает."""
+        p, s, said = reply.params, sess.slots, " ".join(sess.user_texts).lower()
+        if reply.action == "call_date_agent":
+            if s.get("date"):
+                p["EXPRESSION"] = s["date"]
+                return []
+            return [] if p["EXPRESSION"].lower()[:4] in said else ["DATE"]
+        tool_dates = re.findall(r"Tool: RESULT: (\d\d\.\d\d\.\d{4})", " ".join(sess.history.done))
+        model_hour = re.match(r"(\d{1,2})", p.get("TIME", "")) or None
+        vals = {"DATE": s.get("date") or (p.get("DATE") if p.get("DATE") in tool_dates else None),
+                "TIME": s.get("time") or (p.get("TIME") if model_hour and re.search(rf"(?<!\d){int(model_hour.group(1))}(?!\d)", said) else None),
+                "GUESTS": s.get("guests") or (p.get("GUESTS") if re.search(rf"(?<!\d){p.get('GUESTS')}(?!\d)", said) else None),
+                "NAME": s.get("name") or (self._name_from_user(sess, p["NAME"]) if p.get("NAME") else None)}
+        if vals["NAME"] and vals["NAME"].lower()[:4] not in said:
+            vals["NAME"] = None
+        for k, v in vals.items():
+            if v and k in p and str(v) != p[k]:
+                reply.raw = reply.raw.replace(f"{k}: {p[k]}", f"{k}: {v}")
+                p[k] = str(v)
+        return [k for k in NEED[reply.action] if not vals[k]]
+
+    @staticmethod
+    def _ack_ok(sess: Session, text: str) -> bool:
+        """«Понял: дата — …, время — …, гостей — …» модели совпадает с тем, что сказал гость (и что вернул календарь)?"""
+        tool_dates = re.findall(r"Tool: RESULT: (\d\d\.\d\d\.\d{4})", " ".join(sess.history.done + [sess.history._open or ""]))
+        for lab, val in re.findall(r"(дата|время|гостей|имя) — ([^,.?]+(?:\.\d\d\.\d{4})?)", text):
+            key = {"дата": "date", "время": "time", "гостей": "guests", "имя": "name"}[lab]
+            mine = str(sess.slots.get(key, ""))
+            if val.strip() != mine and not (key == "date" and val.strip() in tool_dates):
+                return False
+        said = {k for k in ("date", "time", "guests", "name") if k in sess.slots}
+        named = {{"дата": "date", "время": "time", "гостей": "guests", "имя": "name"}[lab]
+                 for lab in re.findall(r"(дата|время|гостей|имя) — ", text)}
+        return said <= named                                             # модель не «забыла» то, что гость уже сказал
+
+    @staticmethod
+    def _ask_missing(sess: Session, missing: list[str]) -> Optional[str]:
+        """«Записал: дата — 21.10.2026, время — 19:00. Подскажите, пожалуйста, сколько человек будет и на чьё имя оформить бронь?»"""
+        if not missing:
+            return None
+        known = [f"{lab} — {sess.slots[key]}" for k, key, _, lab in FIELDS if key in sess.slots]
+        asks = [q for k, _, q, _ in FIELDS if k in missing]
+        ask = ", ".join(asks[:-1]) + " и " + asks[-1] if len(asks) > 1 else asks[0]
+        return (f"Записал: {', '.join(known)}. " if known else "") + f"Подскажите, пожалуйста, {ask}?"
+
+    @staticmethod
+    def _expecting(sess: Session) -> Optional[str]:
+        """Что бот только что спросил (одно поле) — помогает понять короткий ответ «19» или «Рита»."""
+        if not sess.history.done:
+            return None
+        q = sess.history.done[-1].split("-> Bot:")[-1].lower()
+        asked = [key for key, ws in (("date", ("какую дату", "какой день")), ("time", ("какое время", "какое точное время", "во сколько")),
+                                     ("guests", ("сколько человек", "сколько вас", "сколько гостей")),
+                                     ("name", ("чьё имя", "чье имя", "какое имя", "как вас зовут"))) if any(w in q for w in ws)]
+        return asked[0] if len(asked) == 1 else None
+
+    @staticmethod
+    def _name_from_user(sess: Session, name: str) -> str:
+        """Модель написала «Марат», а гость — «Маргарита»: берём слово гостя с тем же началом."""
+        said = " ".join(sess.user_texts)
+        if name.lower()[:4] in said.lower():
+            return name
+        for w in reversed(re.findall(r"[А-ЯЁA-Z][а-яёa-z]{2,}", said)):
+            if w[:2].lower() == name[:2].lower() and w.lower() not in YES:
+                return w
+        return name
+
+    def _dish_on_menu(self, user_text: str) -> Optional[str]:
+        """Модель сочла вопрос «не по теме», а гость назвал блюдо из меню — отвечаем по menu.json."""
+        for w in re.findall(r"[а-яёa-z]{4,}", user_text.lower()):
+            items = find_items(w, self._menu())
+            if len(items) == 1:
+                it = items[0]
+                return f"Да, у нас есть «{it.name}» — {fmt_price(it.price)}" + (f": {it.description.lower()}." if it.description else ".")
+        return None
+
+    @staticmethod
+    def _lunch_day(user_text: str, text: str) -> str:
+        """«А во вторник есть бизнес-ланч?» — день недели проверяет код (модель путает дни)."""
+        t = user_text.lower()
+        if "ланч" not in t:
+            return text
+        asked = [k for k in WEEKDAYS if k in t]
+        if not asked or re.search(r"\d", t):
+            return text
+        low = text.lower()
+        said_no = not low.startswith("да") and bool(re.search(r"(?<![а-яё])нет(?![а-яё])", low))
+        other_day = any(k in text.lower() and k not in asked for k in ("вторник", "сред", "четверг"))
+        if said_no != bool(WEEKDAYS[asked[0]]) and not other_day:
+            return text                                                  # модель ответила верно
+        return (f"Да, бизнес-ланчи у нас {LUNCH_SCHED}." if WEEKDAYS[asked[0]] else
+                f"Нет, бизнес-ланчи у нас только по будням: {LUNCH_SCHED}.")
+
+    async def _check_facts(self, chat_id: int, sess: Session, res: TurnResult) -> None:
+        """После записи брони или показа брони модель пересказывает её своими словами — сверяем дату, время,
+        гостей и имя с базой; при расхождении говорим данные из базы."""
+        kinds = [str(st.get("result") or "") for st in res.steps]
+        if not any(k in ("booked", "cancelled") or k.startswith("active_booking") for k in kinds):
+            return
+        gone = "cancelled" in kinds and "booked" not in kinds
+        a = sess.cancelled if gone else await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
+        if not a:
+            return
+        for i, m in enumerate(res.messages):
+            t = m.text
+            if m.html or not re.search(r"\d\d\.\d\d\.\d{4}|[Ии]мя", t):
+                continue
+            bad = (any(d != a.date for d in re.findall(r"\d\d\.\d\d\.\d{4}", t))
+                   or any(x != a.time for x in re.findall(r"(?<!\d)\d\d:\d\d", t))
+                   or any(int(g) != a.guests for g in re.findall(r"(\d+) (?:человек|гост)|человек: (\d+)", t) for g in g if g)
+                   or any(n != a.name for n in re.findall(r"[Ии]мя:? ([А-ЯЁA-Z][а-яёa-z\-]+)", t)))
+            lead = re.match(r"([А-ЯЁ][а-яё]+), ", t)
+            if lead and lead.group(1) != a.name and lead.group(1).lower() not in OK_LEAD:
+                t = t[lead.end():]
+                t = t[0].upper() + t[1:]                                 # «Влад, бронь подтверждена» -> имя гостя модель не выдумывает
+            if bad:
+                line = booking_line(a.date, a.time, a.guests, a.name)
+                t = (f"Готово, бронь подтверждена: {line}. Ждём вас в YUQI!" if "booked" in kinds else
+                     f"Бронь отменена: {line}." if gone else
+                     f"У вас есть бронь: {line}." + (" Отменить её?" if "отмен" in m.text.lower() else ""))
+                log.warning("chat=%s: модель исказила данные брони: %r", chat_id, m.text)
+                res.source = "код: проверка брони"
+            res.messages[i] = Message(t)
+
+    async def _check_claims(self, chat_id: int, res: TurnResult) -> None:
+        """Любые слова модели о брони сверяются с фактами: «оформлена» — только если база ответила booked,
+        «отменена» — только если cancelled, «у вас есть бронь» — только если она есть в базе и с теми же датой/временем."""
+        results = " ".join(str(st.get("result") or "") for st in res.steps)
+        for i, m in enumerate(res.messages):
+            t = m.text.lower()
+            if m.html or not (CLAIM_BOOKED.search(t) or CLAIM_CANCELLED.search(t) or CLAIM_EXISTS.search(t)):
+                continue
+            if CLAIM_BOOKED.search(t) and "booked" in results.split():
+                continue
+            if CLAIM_CANCELLED.search(t) and "cancelled" in results:
+                continue
+            a = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
+            if CLAIM_EXISTS.search(t) and not CLAIM_BOOKED.search(t) and not CLAIM_CANCELLED.search(t) and a \
+                    and a.date in m.text and a.time in m.text:
+                continue                                                 # модель верно пересказала бронь из базы
+            log.warning("chat=%s: слова модели о брони не совпали с базой: %r", chat_id, m.text)
+            res.messages[i] = Message(f"Сверился с базой: у вас есть бронь — {booking_line(a.date, a.time, a.guests, a.name)}." if a else
+                                      "Сверился с базой: активной брони у вас сейчас нет.")
+            res.source = "код: проверка брони"
+
+    # ------------------------------------------------------------ проверка формы ответа
     def _problem(self, gen: GenResult, reply: Reply) -> Optional[str]:
         if gen.stop == "max_tokens":
             return "ответ оборван (max_tokens)"
@@ -240,523 +535,6 @@ class Orchestrator:
             return f"низкая уверенность: {gen.mean_logprob:.2f}"
         return None
 
-    # ------------------------------------------------------------ главный вход
-    async def handle_text(self, chat_id: int, text: str, user_name: Optional[str] = None,
-                          on_progress=None) -> TurnResult:
-        """on_progress — async-функция(Message): служебные фразы («Проверяю время.») уходят гостю сразу, а не в конце."""
-        sess = self._session(chat_id)
-        async with sess.lock:                                            # сообщения одного чата идут по очереди
-            now = self.now()
-            if sess.last_active and (now - sess.last_active).total_seconds() > self.ttl_min * 60:
-                sess.reset()                                             # диалог «остыл»
-                sess.forget_recent()
-            sess.last_active = now
-
-            clean = sanitize_user_text(text)
-            if not clean:
-                return TurnResult([Message(EMPTY_TEXT)])
-            self._progress = on_progress
-            return await self._dispatch(chat_id, sess, clean, user_name)
-
-    async def _dispatch(self, chat_id: int, sess: Session, text: str, user_name: Optional[str]) -> TurnResult:
-        """Сначала то, что ведёт код (ответ на вопрос «подтверждаете?», отмена, бронь), потом модель."""
-        offered, sess.offered_booking = sess.offered_booking, False
-        if sess.pending_book:
-            pb, sess.pending_book = sess.pending_book, None
-            if is_yes(text):
-                return await self._do_booking(chat_id, sess, pb)
-            sess.reset()
-            if is_no(text):
-                return TurnResult([Message(DECLINE_BOOK_TEXT)])
-        elif sess.pending_cancel:
-            pc, sess.pending_cancel = sess.pending_cancel, None
-            if is_yes(text, cancel=True):
-                return await self._do_cancel(chat_id, sess, pc)
-            sess.reset()
-            if is_no(text):
-                return TurnResult([Message(KEEP_TEXT + (" Новую бронь не оформляю." if pc.get("resume_text") or pc.get("then_book") else ""))])
-        if self.code_booking and sess.bk:                                # бронь уже идёт — ведёт код
-            return await self._booking_turn(chat_id, sess, text, user_name)
-        if self.code_cancel and is_cancel_intent(text):
-            sess.reset()                                                 # смена темы: старый диалог не тянем
-            return await self._start_cancel(chat_id, sess)
-        if self.code_booking and (is_booking_request(text) or (offered and is_yes(text))):
-            return await self._start_booking(chat_id, sess, "" if offered and is_yes(text) and not is_booking_request(text) else text, user_name)
-        if self.code_cancel and not sess.active_checked and is_booking_request(text):
-            sess.active_checked = True                                   # есть ли уже бронь — смотрим СРАЗУ
-            ab = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
-            if ab:
-                sess.pending_cancel = {"booking": ab, "then_book": None, "resume_text": text}
-                return TurnResult([Message(self._active_text(ab))])
-        sess.user_texts.append(text)
-        return await self._run_turn(chat_id, sess, text, user_name)
-
-    # ------------------------------------------------------------ отмена и бронь, которые ведёт код
-    async def _start_cancel(self, chat_id: int, sess: Session) -> TurnResult:
-        ab = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
-        if not ab:
-            return TurnResult([Message(NO_ACTIVE_TEXT)])
-        sess.pending_cancel = {"booking": ab, "then_book": None}
-        return TurnResult([Message(f"У вас есть бронь: {booking_line(ab.date, ab.time, ab.guests, ab.name)}. Отменить её?")])
-
-    async def _do_cancel(self, chat_id: int, sess: Session, pc: dict) -> TurnResult:
-        now = self.now()
-        old = await asyncio.to_thread(self.db.cancel_active, chat_id, now)
-        if not old:
-            sess.reset()
-            return TurnResult([Message(NO_ACTIVE_TEXT)])
-        out = TurnResult()
-        then = pc.get("then_book")
-        resume = pc.get("resume_text")
-        if resume:                                                       # гость хотел бронь — продолжаем с его сообщения
-            sess.reset()
-            sess.in_booking = sess.active_checked = True
-            sess.user_texts.append(resume)
-            if self.code_booking:
-                res = await self._start_booking(chat_id, sess, resume, None)
-            else:
-                res = await self._run_turn(chat_id, sess, resume, None)
-            res.messages.insert(0, Message("Старую бронь отменил."))
-            return res
-        if not then:
-            sess.reset()
-            out.messages.append(Message(f"Готово, бронь отменена: {booking_line(old.date, old.time, old.guests, old.name)}. "
-                                        "Если захотите, можно забронировать снова."))
-            return out
-        out.messages.append(Message("Старую бронь отменил. Теперь проверяю новую."))
-        if self.code_booking:
-            sess.reset()
-            sess.in_booking = sess.active_checked = True
-            sess.bk = {"slots": {"date": then["DATE"], "time": then["TIME"], "guests": int(then["GUESTS"]), "name": then["NAME"]},
-                       "stage": "collect"}
-            return await self._advance(chat_id, sess, out)
-        ok = await asyncio.to_thread(self.db.has_free_table, int(then["GUESTS"]), then["DATE"], then["TIME"])
-        if not ok:
-            sess.reset()
-            out.messages.append(Message(f"К сожалению, на {then['DATE']} в {then['TIME']} столик на {then['GUESTS']} "
-                                        f"{people_word(int(then['GUESTS']))} занят. Напишите, пожалуйста, новую бронь: дату, "
-                                        "время, количество человек и имя."))
-            return out
-        return self._ask_confirm(sess, then, out)
-
-    def _ask_confirm(self, sess: Session, p: dict, out: TurnResult, keep_bk: bool = False) -> TurnResult:
-        if not keep_bk:
-            sess.pending_book = dict(p)
-        out.messages.append(Message(
-            "Свободный столик есть. Проверьте, пожалуйста, данные брони:\n"
-            f"Время: {p['DATE']}, {p['TIME']}\nКоличество человек: {p['GUESTS']}\nИмя: {p['NAME']}\n"
-            "Подтверждаете бронь? Напишите «да» или «нет»."))
-        return out
-
-    async def _do_booking(self, chat_id: int, sess: Session, p: dict) -> TurnResult:
-        r = await asyncio.to_thread(self.db.book_table, int(p["GUESTS"]), p["DATE"], p["TIME"], p["NAME"], chat_id, self.now())
-        out = TurnResult()
-        sess.reset()
-        if r.status == "booked":
-            out.messages.append(Message(f"Готово, бронь подтверждена! Время: {p['DATE']}, {p['TIME']}. "
-                                        f"Количество человек: {p['GUESTS']}. Имя: {p['NAME']}. Ждём вас в YUQI!"))
-        elif r.status == "table_busy":
-            out.messages.append(Message("К сожалению, этот столик только что заняли. Напишите, пожалуйста, другое время."))
-        elif r.status == "active_booking_exists":
-            a = r.active
-            sess.pending_cancel = {"booking": a, "then_book": dict(p)}
-            out.messages.append(Message(self._active_text(a)))
-        else:
-            out.messages.append(Message(r.reason))
-        return out
-
-
-    # ------------------------------------------------------------ бронь, которую ведёт код
-    async def _start_booking(self, chat_id: int, sess: Session, text: str, user_name: Optional[str] = None) -> TurnResult:
-        if not sess.active_checked:
-            sess.active_checked = True                                   # есть ли уже бронь — смотрим СРАЗУ
-            ab = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
-            if ab:
-                sess.pending_cancel = {"booking": ab, "then_book": None, "resume_text": text}
-                return TurnResult([Message(self._active_text(ab))])
-        sess.in_booking = True
-        sess.bk = {"slots": {}, "stage": "collect", "started": True}
-        return await self._booking_turn(chat_id, sess, text, user_name)
-
-    async def _faq(self, chat_id: int, text: str, user_name: Optional[str]) -> TurnResult:
-        """Вопрос посреди брони (адрес, Wi-Fi, меню): отвечает модель в чистой истории; бронь не трогаем."""
-        tmp = Session(faq_only=True)
-        tmp.user_texts.append(text)
-        res = await self._run_turn(chat_id, tmp, text, user_name)
-        if any(m.text == FALLBACK_TEXT or m.text == RESET_TEXT for m in res.messages):
-            res.messages = []
-        return res
-
-    @staticmethod
-    def _params(s: dict) -> dict:
-        return {"DATE": s["date"], "TIME": s["time"], "GUESTS": str(s["guests"]), "NAME": s["name"]}
-
-    async def _booking_turn(self, chat_id: int, sess: Session, text: str, user_name: Optional[str] = None) -> TurnResult:
-        bk, out, now = sess.bk, TurnResult(), self.now()
-        s = bk["slots"]
-        started = bk.pop("started", False)
-        if not started and is_abort(text):
-            sess.reset()
-            return TurnResult([Message("Хорошо, ничего не бронирую. Если понадобится столик, напишите.")])
-        missing = [k for k in ("date", "time", "guests", "name") if k not in s]
-        ex = slotlib.extract(text, now.date(), missing[0] if len(missing) == 1 else None)
-        changed = {k: v for k, v in ex.items() if s.get(k) != v}
-
-        if bk["stage"] == "confirm":
-            if changed and set(changed) == {"name"} and is_yes(text):
-                changed = {}
-            if changed:
-                s.update(changed)
-                bk["stage"] = "collect"
-                return await self._advance(chat_id, sess, out)
-            if is_yes(text):
-                return await self._do_booking(chat_id, sess, self._params(s))
-            if is_no(text):
-                sess.reset()
-                return TurnResult([Message(DECLINE_BOOK_TEXT)])
-            res = await self._faq(chat_id, text, user_name)
-            res.messages.append(Message("Подтверждаете бронь? Напишите «да» или «нет»."))
-            return res
-
-        if not ex and not started:
-            if is_no(text) or is_yes(text):
-                return await self._advance(chat_id, sess, out)           # просто повторяем вопрос
-            res = await self._faq(chat_id, text, user_name)
-            nxt = await self._advance(chat_id, sess, TurnResult())
-            res.messages += nxt.messages
-            res.steps += nxt.steps
-            return res
-        s.update(ex)
-        return await self._advance(chat_id, sess, out)
-
-    async def _advance(self, chat_id: int, sess: Session, out: TurnResult) -> TurnResult:
-        """Проверить собранное, переспросить недостающее или показать бронь на подтверждение."""
-        bk, now = sess.bk, self.now()
-        s = bk["slots"]
-        errs: list[str] = []
-        if "date" in s:
-            err = validate_booking_date(s["date"], now.date())
-            if err:
-                errs.append(err)
-                del s["date"]
-        if "guests" in s and not (1 <= s["guests"] <= MAX_GUESTS_PER_BOOKING):
-            errs.append(f"Забронировать столик можно максимум на {MAX_GUESTS_PER_BOOKING} человек.")
-            del s["guests"]
-        if "date" in s and "time" in s:
-            if bk.get("time_ok") != (s["date"], s["time"]):              # то же время уже проверяли — не повторяем
-                await self._say(out, Message("Проверяю время."))
-                problem = check_slot(s["date"], s["time"], now)
-                if problem:
-                    errs.append(problem.text)
-                    del s["time"]
-                else:
-                    bk["time_ok"] = (s["date"], s["time"])
-        missing = [k for k in ("date", "time", "guests", "name") if k not in s]
-        if missing:
-            bk["stage"] = "collect"
-            known = {"date": "дата", "time": "время", "guests": "гостей", "name": "имя"}
-            have = ", ".join(f"{known[k]} — {s[k]}" for k in ("date", "time", "guests", "name") if k in s)
-            ask = [ASK[k] for k in missing]
-            q = "Подскажите, пожалуйста, " + (ask[0] if len(ask) == 1 else ", ".join(ask[:-1]) + " и " + ask[-1]) + "?"
-            head = " ".join(errs) if errs else (f"Хорошо, {have}." if have else "")
-            if errs and have:
-                head += f" Пока записано: {have}."
-            out.messages.append(Message((head + " " + q).strip()))
-            return out
-        await self._say(out, Message("Проверяю свободные столики."))
-        p = self._params(s)
-        ok = await asyncio.to_thread(self.db.has_free_table, s["guests"], s["date"], s["time"])
-        if not ok:
-            out.messages.append(Message(f"К сожалению, на {s['date']} в {s['time']} столик на {s['guests']} "
-                                        f"{people_word(s['guests'])} занят. Напишите, пожалуйста, другое время."))
-            del s["time"]
-            bk["stage"] = "collect"
-            return out
-        bk["stage"] = "confirm"
-        return self._ask_confirm(sess, p, out, keep_bk=True)
-
-    @staticmethod
-    def _active_text(a) -> str:
-        return (f"У вас уже есть бронь: {booking_line(a.date, a.time, a.guests, a.name)}. Нельзя бронировать несколько "
-                "столиков, пока не наступило время текущей брони. Хотите отменить старую бронь?")
-
-    async def _run_turn(self, chat_id: int, sess: Session, user_text: str,
-                        user_name: Optional[str] = None) -> TurnResult:
-        """Обёртка: модель получает последние RECENT_EXCHANGES обменов как контекст («а в выходные?»), и обмен запоминается.
-
-        В контекст попадают только завершённые текстовые ответы модели — ровно в том виде, в каком такие
-        многошаговые диалоги лежат в датасете («User: … -> Bot: … || User: … -> Bot:»). Ответы кода (меню, бронь)
-        и ответы с ACTION в контекст не идут."""
-        fresh = not sess.history.done
-        use_ctx = fresh and bool(sess.recent) and not sess.faq_only
-        if use_ctx:
-            sess.history.done.extend(sess.recent)
-        prev = list(sess.recent_full) if use_ctx else []
-        out = await self._run_turn_inner(chat_id, sess, user_text, user_name)
-        if use_ctx and (out.rejected or self._copies_context(out, prev, user_text)):
-            # маленькая модель иногда повторяет прошлый ответ из контекста — тогда отвечаем без контекста
-            log.warning("chat=%s: ответ отклонён или повторяет прошлый, повтор без контекста", chat_id)
-            sess.reset()
-            out = await self._run_turn_inner(chat_id, sess, user_text, user_name)
-        if (fresh and not sess.faq_only and not out.rejected and len(out.steps) == 1 and out.steps[0]["action"] is None
-                and out.messages and not out.messages[0].html and not sess.history.done
-                and not GENERIC_RE.search(out.messages[0].text.lower())
-                and not (sess.bk or sess.pending_book or sess.pending_cancel or sess.in_booking)):
-            sess.recent.append(self._segment(user_text, out.messages[0].text))
-            sess.recent_full.append((user_text, out.messages[0].text))
-            del sess.recent[:-RECENT_EXCHANGES], sess.recent_full[:-RECENT_EXCHANGES]
-        return out
-
-    @staticmethod
-    def _copies_context(out: TurnResult, prev: list, user_text: str) -> bool:
-        """Модель скопировала прошлый ответ: почти дословно, или похоже и это снова общее «чем могу помочь»."""
-        if not out.messages or out.messages[0].html:
-            return False
-        norm_text = lambda x: re.sub(r"\W+", " ", x.lower()).strip()
-        first, u = norm_text(out.messages[0].text), norm_text(user_text)
-        for pu, pb in prev:
-            if not pb or norm_text(pu) == u:
-                continue                                                 # гость сам повторил вопрос — одинаковый ответ нормален
-            ratio = difflib.SequenceMatcher(None, first, norm_text(pb)).ratio()
-            if ratio >= 0.9 or (ratio >= 0.55 and "чем могу помочь" in first):
-                return True
-        return False
-
-    @staticmethod
-    def _segment(user_text: str, bot_text: str) -> str:
-        """Сегмент контекста в формате датасета: «User: вопрос -> Bot: ответ»."""
-        line = html.unescape(re.sub(r"<[^>]+>", "", bot_text)).replace("->", " ").replace("||", " ")
-        line = re.sub(r"\s+", " ", line).strip()[:400]
-        return f"User: {sanitize_user_text(user_text)}{ARROW} {line}".rstrip()
-
-    async def _run_turn_inner(self, chat_id: int, sess: Session, user_text: str,
-                              user_name: Optional[str] = None) -> TurnResult:
-        h, out = sess.history, TurnResult()
-        if self.code_menu:
-            msgs = menu_router.route(user_text, self._menu(), self.rng, sess.menu_ctx)
-            if msgs:
-                out.messages += [Message(t, True) for t in msgs]
-                sess.reset()
-                return out
-        prompt = h.prompt_for_user(user_text)
-
-        for _ in range(self.max_tool_steps + 1):
-            try:
-                gen: GenResult = await self.llm.agenerate(prompt)
-            except PromptTooLong:
-                sess.reset()
-                out.messages.append(Message(RESET_TEXT))
-                return out
-            reply = parse_reply(gen.text)
-            out.steps.append({"prompt": prompt, "raw": reply.raw, "logprob": round(gen.mean_logprob, 3),
-                              "action": reply.action})
-            problem = self._problem(gen, reply)
-            if problem:
-                log.warning("chat=%s: %s | prompt=...%s | raw=%r", chat_id, problem, prompt[-120:], reply.raw)
-                return self._reject(sess, out, user_text)
-            if self.grounding and len(out.steps) == 1:
-                fix = self._topic_guard(chat_id, user_name, user_text, reply, out)
-                if fix:
-                    log.warning("chat=%s: ответ модели не по теме вопроса: %r", chat_id, reply.raw)
-                    sess.reset()
-                    return fix
-
-            # --- бронь ведёт код: модель в ней не участвует
-            if self.code_booking and ((not reply.has_action and BOOKING_ASK_RE.search(reply.text.lower()))
-                                      or reply.action in BOOKING_ACTIONS):
-                if sess.faq_only or not has_booking_words(user_text):
-                    return self._reject(sess, out, user_text)
-                return await self._start_booking(chat_id, sess, user_text, user_name)
-
-            # --- модель вдруг заговорила про бронь, хотя гость о ней не просил
-            if self.grounding and not self._booking_context(sess) and (
-                    (not reply.has_action and BOOKING_ASK_RE.search(reply.text.lower()))
-                    or reply.action in BOOKING_ACTIONS):
-                log.warning("chat=%s: бронь без запроса гостя: %r", chat_id, reply.raw)
-                return self._reject(sess, out, user_text)
-
-            # --- фильтр меню, о котором гость не спрашивал (опечатки сбивают модель)
-            if (self.grounding and reply.action == "call_menu_filter_agent"
-                    and not FILTER_WORDS_RE.search(norm(user_text))):
-                log.warning("chat=%s: фильтр без запроса гостя: %r", chat_id, reply.raw)
-                return self._reject(sess, out, user_text)
-
-            # --- обычный текстовый ответ
-            if not reply.has_action:
-                reply = await self._vary(prompt, reply)
-                early = self._early_time_check(reply.text) if self.grounding else None
-                if early:                                                # время уже прошло / вне часов — говорим сразу
-                    out.messages.append(Message(early))
-                    h.commit(early)
-                    return out
-                out.messages.append(Message(reply.text))
-                h.commit(reply.raw)
-                if not expects_answer(reply) or GENERIC_RE.search(reply.text.lower()):
-                    sess.reset()                                         # вопрос закрыт (или это приветствие) — диалог закончен
-                if self.code_booking and re.search(r"забронир|столик", reply.text.lower()) and reply.text.rstrip().endswith("?"):
-                    sess.offered_booking = True                          # «Хотите забронировать?» -> «да» запускает бронь
-                return out
-
-            # --- инструменты с результатом: код выполняет и возвращает результат модели
-            if reply.action in TOOLS_WITH_RESULT:
-                if self.grounding and reply.action in BOOKING_PARAM_ACTIONS:
-                    ask = self._check_params(sess, reply)
-                    if ask:                                              # модель выдумала имя/число гостей/время
-                        out.messages.append(Message(ask))
-                        h.commit(ask)
-                        return out
-                if self.confirm_booking and reply.action == "book_table":
-                    h.commit(reply.raw)                                  # финал и «да» ведёт код
-                    self._ask_confirm(sess, reply.params, out)
-                    return out
-                if self.show_progress and reply.text:                    # «Проверяю время.» — сразу, до выполнения
-                    await self._say(out, Message(reply.text))
-                try:
-                    result, direct_text = await self._run_tool(chat_id, sess, reply)
-                except Exception:
-                    log.exception("chat=%s: инструмент %s упал", chat_id, reply.action)
-                    sess.reset()
-                    out.messages.append(Message(TOOL_FAIL_TEXT))
-                    return out
-                if direct_text:                                          # код сам объясняет гостю (дата не понята и т.п.)
-                    out.messages.append(Message(direct_text))
-                    h.commit(direct_text)                                # в историю — текст вместо ACTION
-                    if not expects_answer(Reply(raw=direct_text, text=direct_text)):
-                        sess.reset()
-                    return out
-                h.commit(reply.raw)
-                prompt = h.prompt_for_tool(result)
-                continue
-
-            # --- конечные действия
-            if reply.action in MENU_ACTIONS:
-                # перед меню модель любит «досочинять» (блюда, остроту) — текст заменяем безопасным вступлением, факты даст код
-                out.messages.append(Message(self.rng.choice(MENU_INTROS)))
-            elif reply.text:
-                out.messages.append(Message(reply.text))
-            self._run_terminal(chat_id, user_name, user_text, reply, out)
-            h.commit(reply.raw)
-            sess.reset()
-            return out
-
-        log.warning("chat=%s: слишком много шагов инструментов", chat_id)
-        sess.reset()
-        out.messages.append(Message(FALLBACK_TEXT))
-        return out
-
-    async def _vary(self, prompt: str, reply: Reply) -> Reply:
-        """Свобода формулировок: тот же ответ, но модель переписывает его сама (temperature>0). Факты не трогаем:
-        цифры должны совпасть с базовым (жадным) ответом, вопросительность и длина — тоже, иначе остаётся базовый."""
-        if self.temperature <= 0 or not reply.text:
-            return reply
-        try:
-            gen2 = await self.llm.agenerate(prompt, temperature=self.temperature, top_k=40)
-        except Exception:
-            return reply
-        r2 = parse_reply(gen2.text)
-        if r2.has_action or not r2.text or self._problem(gen2, r2):
-            return reply
-        digits = lambda x: sorted(re.findall(r"\d+", x))
-        if digits(r2.text) != digits(reply.text) or r2.text.rstrip().endswith("?") != reply.text.rstrip().endswith("?"):
-            return reply
-        if not 0.6 <= len(r2.text) / max(len(reply.text), 1) <= 1.6:
-            return reply
-        return r2
-
-    def _reject(self, sess: Session, out: TurnResult, user_text: str) -> TurnResult:
-        """Ответ модели не годится: пробуем понять гостя по ключевым словам (опечатки), иначе — «не понял»."""
-        sess.reset()
-        if self.grounding and looks_like_business_lunch(user_text):
-            out.messages.append(Message(f"Бизнес-ланчи у нас {SCHED}. Присылаю меню бизнес-ланчей."))
-            out.messages += [Message(t, True) for t in tool_show_business_lunch(self._menu())]
-        elif self.grounding and (flt := menu_router.detect_filter(user_text)):          # модель исказила название фильтра
-            out.messages += [Message(t, True) for t in tool_filter(flt, self._menu())]
-        elif self.grounding and looks_like_menu(user_text):
-            out.messages += [Message(t, True) for t in tool_show_menu("all", self._menu())]
-        elif (faq := self._faq_fallback(user_text)):
-            out.messages.append(Message(faq))
-        else:
-            out.messages.append(Message(FALLBACK_TEXT))
-        out.rejected = True
-        return out
-
-    def _topic_guard(self, chat_id: int, user_name: Optional[str], user_text: str, reply: Reply, out: TurnResult) -> Optional[TurnResult]:
-        """Модель ответила складно, но не на тот вопрос (на «Привет» — про Wi-Fi, на жалобу — «спасибо»): отвечает код."""
-        t, r = norm(user_text), (reply.text + " " + (reply.action or "")).lower()
-        if reply.action in BOOKING_ACTIONS or reply.action in TOOLS_WITH_RESULT:
-            return None
-        # отзывы: жалоба должна получить извинение и тихое уведомление, похвала — благодарность
-        if COMPLAINT_RE.search(t) and not re.search(r"жаль|извин|прости|сожален", r):
-            res = TurnResult(steps=out.steps)
-            res.messages.append(Message(self.rng.choice([
-                "Нам очень жаль, что вы остались недовольны. Спасибо, что рассказали, — мы обязательно разберёмся в ситуации.",
-                "Простите, что так получилось. Спасибо, что написали, мы передадим ваш отзыв и разберёмся."])))
-            self._run_terminal(chat_id, user_name, user_text, Reply(raw="ACTION: notify_manager", action="notify_manager"), res)
-            return res
-        if PRAISE_RE.search(t) and not COMPLAINT_RE.search(t) and not re.search(r"спасибо|рад|приятно", r):
-            return TurnResult([Message(self.rng.choice(["Спасибо за тёплый отзыв! Будем рады видеть вас снова в YUQI.",
-                                                        "Спасибо, очень приятно! Ждём вас снова в YUQI."]))], steps=out.steps)
-        for q_rx, must, answers in TOPIC_GUARD:
-            if q_rx.search(t) and not must.search(r):
-                return TurnResult([Message(self.rng.choice(answers))], steps=out.steps)
-        # вопросы о ресторане (часы, адрес, алкоголь, Wi-Fi, парковка, бонусы, доставка)
-        for (q_rx, answers), must in zip(FAQ_FALLBACK, FAQ_MUST):
-            if q_rx.search(t) and not must.search(r):
-                return TurnResult([Message(self.rng.choice(answers))], steps=out.steps)
-        if re.search(r"алкогол|вино|пиво|спиртн", t) and re.match(r"\s*да\b", r) and "нет" in r:
-            return TurnResult([Message(self.rng.choice(FAQ_FALLBACK[2][1]))], steps=out.steps)   # «Да, алкоголя нет»
-        return None
-
-    def _faq_fallback(self, user_text: str) -> Optional[str]:
-        t = norm(user_text)
-        for rx, answers in FAQ_FALLBACK:
-            if rx.search(t):
-                return self.rng.choice(answers)
-        return None
-
-    async def _say(self, out: TurnResult, m: Message) -> None:
-        if self._progress:
-            await self._progress(m)
-        else:
-            out.messages.append(m)
-
-    # ------------------------------------------------------------ защита от выдумок модели
-    @staticmethod
-    def _booking_context(sess: Session) -> bool:
-        return sess.in_booking or bool(sess.known_dates) or any(has_booking_words(t) for t in sess.user_texts)
-
-    def _early_time_check(self, text: str) -> Optional[str]:
-        """Модель переспрашивает и повторяет «дата — …, время — …»: если время уже прошло или вне часов, говорим сразу."""
-        m = EARLY_RE.search(text)
-        if not m:
-            return None
-        problem = check_slot(m.group(1), m.group(2), self.now())
-        if problem is None:
-            return None
-        if problem.code == "outside_hours":
-            return (f"Мы работаем с 10:00 до 23:00, поэтому на {m.group(2)} забронировать столик не получится. "
-                    "Напишите, пожалуйста, другое время.")
-        if problem.code == "past_time":
-            return "Это время уже прошло. Напишите, пожалуйста, другое время."
-        return None
-
-    def _check_params(self, sess: Session, reply: Reply) -> Optional[str]:
-        """None — параметры можно выполнять; иначе — вопрос гостю вместо выдуманного значения."""
-        p = reply.params
-        if reply.action == "call_booking_time_agent":
-            bad = ungrounded(p, " ".join(sess.user_texts), sess.known_dates)
-            if bad:
-                log.warning("в брони выдуманы поля %s: %r", bad, reply.raw)
-                items = [ASK[k] for k in ("date", "time", "guests", "name") if k in bad]
-                return "Подскажите, пожалуйста, " + (items[0] if len(items) == 1 else ", ".join(items[:-1]) + " и " + items[-1]) + "?"
-            sess.booking = dict(p)
-            return None
-        if sess.booking is None or any(p[k] != sess.booking[k] for k in ("DATE", "TIME", "GUESTS", "NAME")):
-            log.warning("параметры брони изменились между шагами: %r", reply.raw)
-            sess.booking = None
-            return "Давайте уточним: напишите, пожалуйста, дату, время, количество человек и имя для брони."
-        return None
-
     # ------------------------------------------------------------ инструменты с результатом
     async def _run_tool(self, chat_id: int, sess: Session, reply: Reply) -> tuple[Optional[str], Optional[str]]:
         """-> (результат для модели, None) или (None, текст для гостя вместо продолжения цепочки)."""
@@ -767,10 +545,7 @@ class Orchestrator:
             if d is None:
                 return None, BAD_DATE_TEXT
             err = validate_booking_date(d, now.date())
-            if err:
-                return None, err
-            sess.known_dates.add(d)
-            return d, None
+            return (None, err) if err else (d, None)
 
         if a == "call_booking_time_agent":
             problem = check_slot(p["DATE"], p["TIME"], now)
@@ -778,7 +553,7 @@ class Orchestrator:
                 return "time_valid", None
             if problem.code in ("outside_hours", "past_time"):
                 return f"invalid_time | REASON: {problem.code}", None
-            return None, problem.text                                    # кривая дата/время — модель такое не видела
+            return None, problem.text
 
         if a == "call_free_tables_agent":
             problem = check_slot(p["DATE"], p["TIME"], now)
@@ -786,22 +561,16 @@ class Orchestrator:
                 return None, problem.text
             old = await asyncio.to_thread(self.db.active_booking, chat_id, now)
             if old:                                                      # у гостя уже есть бронь
-                if self.code_cancel:
-                    sess.pending_cancel = {"booking": old, "then_book": dict(sess.booking or p)}
-                    return None, self._active_text(old)
                 sess.cancel_armed = True
                 return old.as_exists_result(), None
             ok = await asyncio.to_thread(self.db.has_free_table, int(p["GUESTS"]), p["DATE"], p["TIME"])
             return ("available" if ok else "unavailable"), None
 
-        if a == "book_table":
-            r = await asyncio.to_thread(self.db.book_table, int(p["GUESTS"]), p["DATE"], p["TIME"],
-                                        p["NAME"], chat_id, now)
-            if r.status == "booked":
-                return "booked", None
-            if r.status == "table_busy":
-                return "table_busy", None
-            if r.status == "active_booking_exists":                      # гость успел забронировать параллельно
+        if a == "book_table":                                            # база заново проверяет время, гостей, занятость
+            r = await asyncio.to_thread(self.db.book_table, int(p["GUESTS"]), p["DATE"], p["TIME"], p["NAME"], chat_id, now)
+            if r.status in ("booked", "table_busy"):
+                return r.status, None
+            if r.status == "active_booking_exists":
                 sess.cancel_armed = True
                 return r.active.as_exists_result(), None
             return None, r.reason
@@ -816,22 +585,22 @@ class Orchestrator:
                 log.warning("chat=%s: cancel_booking без показанной брони", chat_id)
                 return None, "Сначала давайте проверим вашу бронь. Напишите, пожалуйста, что хотите отменить бронь."
             old = await asyncio.to_thread(self.db.cancel_active, chat_id, now)
-            sess.cancel_armed = False
+            sess.cancel_armed, sess.cancelled = False, old
             return ("cancelled" if old else "no_active_booking"), None
 
         raise ValueError(a)
 
     # ------------------------------------------------------------ конечные действия
     def _run_terminal(self, chat_id: int, user_name: Optional[str], user_text: str, reply: Reply, out: TurnResult) -> None:
-        a, p = reply.action, reply.params
+        a, p, m = reply.action, reply.params, self._menu()
         if a == "show_menu":
-            out.messages += [Message(t, True) for t in tool_show_menu(p["CATEGORY"], self._menu())]
+            out.messages += [Message(t, True) for t in tool_show_menu(p["CATEGORY"], m)]
         elif a == "show_business_lunch":
-            out.messages += [Message(t, True) for t in tool_show_business_lunch(self._menu())]
+            out.messages += [Message(t, True) for t in tool_show_business_lunch(m)]
         elif a == "call_menu_filter_agent":
-            out.messages += [Message(t, True) for t in tool_filter(p["FILTER"], self._menu())]
+            out.messages += [Message(t, True) for t in tool_filter(p["FILTER"], m)]
         elif a == "call_price_agent":
-            out.messages.append(Message(tool_price(p["ITEM"], self._menu()), True))
+            out.messages.append(Message(tool_price(p["ITEM"], m), True))
         elif a == "notify_manager":                                      # жалоба: гость уже получил ответ модели
             try:
                 self.db.save_review(chat_id, user_name, user_text, True, self.now())
