@@ -79,6 +79,8 @@ AVAIL_GENERIC = ("блюд", "еда", "еду", "напит", "десерт", "
 AVAIL_MAX = 5
 CHECK_BOOKING2 = re.compile(r"(?:мо[яюиеё]|моих)\s+(?:активн\w+\s+)?брон\w*|у меня\s+(?:\w+\s+){0,2}брон\w*|(?:^|\s)есть\s+(?:ли\s+)?(?:активн\w+\s+)?брон\w*$")
 NOT_CHECK = re.compile(r"отмен|перенес|перенос|измен|удал|заброн|хочу|нужн|сдела|оформ|нов[уы]ю|нов[ыо]е|свободн|\d")
+WORD_NUMS = {"один": 1, "одна": 1, "одного": 1, "одну": 1, "двое": 2, "два": 2, "две": 2, "двоих": 2, "вдвоем": 2, "трое": 3, "три": 3, "троих": 3,
+             "втроем": 3, "четверо": 4, "четыре": 4, "четверых": 4, "вчетвером": 4, "пятеро": 5, "пять": 5, "шестеро": 6, "шесть": 6, "семеро": 7, "семь": 7}
 BARE_YES = ("да", "ага", "угу", "ок", "окей", "давай", "давайте", "конечно")
 OFFER_BOOK = re.compile(r"(?:хотите|помогу|могу|желаете).{0,50}(?:брон|столик)|(?:брон|столик).{0,50}(?:хотите|помогу|желаете)")
 BOOK_ASK = "Отлично! Подскажите, пожалуйста, на какую дату, на какое время, сколько человек будет и на чьё имя оформить бронь?"
@@ -245,6 +247,8 @@ class Orchestrator:
             sess.last_slots = extract_slots(clean, now.date(), expecting)
             if expecting != "time" and not TIME_SAID.search(clean.lower()):
                 sess.last_slots.pop("time", None)                        # «нас будет 4» — это гости, а не 16:00
+            if "guests" not in sess.last_slots and self._word_guests(norm, expecting):
+                sess.last_slots["guests"] = str(self._word_guests(norm, expecting))     # «Один», «нас двое», «человек один»
             if len(sess.last_slots.get("name", "")) < 3:
                 sess.last_slots.pop("name", None)                        # «Не», «Да» — не имена
             g = sess.last_slots.get("guests")
@@ -418,9 +422,21 @@ class Orchestrator:
 
         return self._fallback(sess, out, f"chat={chat_id}: слишком много шагов инструментов")
 
-    @staticmethod
-    def _fallback(sess: Session, out: TurnResult, why: str) -> TurnResult:
+    def _fallback(self, sess: Session, out: TurnResult, why: str) -> TurnResult:
         log.warning(why)
+        if self.grounding and not sess.pending_book and sess.user_texts and (sess.slots or sess.booking_ok) and self._booking_wanted(sess):
+            # шла бронь: одна непонятая реплика не должна стирать уже собранные дату, время, гостей и имя — спрашиваем недостающее
+            missing = [k for k, key, _, _ in FIELDS if key not in sess.slots]
+            res = TurnResult(steps=out.steps, source="код: бронь")
+            if missing:
+                res.messages.append(Message(self._ask_missing(sess, missing)))
+            else:
+                self._ask_confirm(sess, {k: str(sess.slots[key]) for k, key, _, _ in FIELDS}, res)
+            sess.history.reset()
+            sess.history.prompt_for_user(sess.user_texts[-1])
+            sess.history.commit(res.messages[0].text)
+            sess.ctx_closed = False
+            return res
         sess.reset()
         return TurnResult([Message(FALLBACK_TEXT)], steps=out.steps, source="запасной ответ")
 
@@ -506,6 +522,20 @@ class Orchestrator:
             log.exception("не удалось запомнить показанное меню")
 
     @staticmethod
+    def _word_guests(norm: str, expecting: Optional[str]) -> Optional[int]:
+        """Число гостей словами: «Один» в ответ на «сколько человек», «нас двое», «человек один», «вдвоём»."""
+        toks = norm.split()
+        for i, w in enumerate(toks):
+            n = WORD_NUMS.get(w)
+            if n is None:
+                continue
+            prev, nxt = toks[i - 1] if i else "", toks[i + 1] if i + 1 < len(toks) else ""
+            if (expecting == "guests" and len(toks) <= 4) or prev in ("нас", "будет", "я", "человек", "гостей", "гость") \
+                    or nxt in ("человек", "человека", "гостя", "гостей") or w.startswith(("вдво", "втро", "вчет")):
+                return n
+        return None
+
+    @staticmethod
     def _norm(text: str) -> str:
         """Нижний регистр, «ё» -> «е», без знаков препинания."""
         return " ".join(re.sub(r"[^\w\s]", " ", text.lower().replace("ё", "е")).split())
@@ -536,6 +566,15 @@ class Orchestrator:
         if self._expecting(sess):
             return None
         words = norm.split()
+        if words and len(words) <= 3 and words[0] in ("нет", "неа") and set(words[1:]) <= {"спасибо", "не", "надо", "нужно", "пока", "уже"}:
+            last_bot = re.sub(r"<[^>]+>", "", " ".join(sess.prev_msgs)).lower()          # одинокое «Нет» — не жалоба, а ответ на вопрос бота
+            text = ("Хорошо, бронь остаётся без изменений. Могу чем-то ещё помочь?" if sess.cancel_armed or "отмен" in last_bot
+                    else "Хорошо. Если понадоблюсь — обращайтесь!")
+            sess.reset()                                                 # отказ: собранные данные, «cancel_armed» и контекст сбрасываем
+            res = TurnResult([Message(text)], source="код: отказ")
+            sess.prev_msgs, sess.prev_raws, sess.prev_user = [text], set(), clean.lower()
+            self.stats[res.source] += 1
+            return res
         if words and len(words) <= 2 and words[0] in BARE_YES and not sess.cancel_armed:   # «Отменить её?» — «Да» разбирает модель
             last_bot = re.sub(r"<[^>]+>", "", " ".join(sess.prev_msgs)).lower()          # что бот реально отправил в прошлый ход
             if OFFER_BOOK.search(last_bot) and "отмен" not in last_bot:
@@ -664,7 +703,8 @@ class Orchestrator:
         model_hour = re.match(r"(\d{1,2})", p.get("TIME", "")) or None
         vals = {"DATE": s.get("date") or (p.get("DATE") if p.get("DATE") in tool_dates else None),
                 "TIME": s.get("time") or (p.get("TIME") if model_hour and re.search(rf"(?<!\d){int(model_hour.group(1))}(?!\d)", said) else None),
-                "GUESTS": s.get("guests") or (p.get("GUESTS") if p.get("GUESTS") and re.search(rf"(?<!\d){re.escape(p['GUESTS'])}(?!\d)", said) else None),
+                "GUESTS": s.get("guests") or (p.get("GUESTS") if p.get("GUESTS") and re.search(
+                    rf"(?<![\d:.]){re.escape(p['GUESTS'])}(?![\d:.]|\s*(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|час|ч\b|руб|₽))", said) else None),
                 "NAME": s.get("name") or (self._name_from_user(sess, p["NAME"]) if p.get("NAME") else None)}
         if vals["NAME"] and vals["NAME"].lower()[:4] not in said:
             vals["NAME"] = None
@@ -844,6 +884,7 @@ class Orchestrator:
             return None, problem.text
 
         if a in ("call_free_tables_agent", "book_table") and int(p["GUESTS"]) > MAX_GUESTS:
+            sess.slots.pop("guests", None)
             return None, GUEST_LIMIT_TEXT                                # не «столик занят», а честная причина
         if a == "call_free_tables_agent":
             problem = check_slot(p["DATE"], p["TIME"], now)
