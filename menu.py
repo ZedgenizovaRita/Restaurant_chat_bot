@@ -80,6 +80,7 @@ class Menu:
         for d in rows:
             d = {k: v for k, v in d.items() if not k.startswith("_") and k in Item.__dataclass_fields__}
             d["aliases"] = tuple(d.get("aliases") or ())
+            d["description"] = d.get("description") or ""             # "description": null в menu.json не должен ронять форматирование
             if lunch:
                 d["business_lunch"], d["category"] = True, None        # всё из файла бизнес-ланчей — бизнес-ланчи
             if d.get("vegetarian") is None and d.get("vegan") is True:

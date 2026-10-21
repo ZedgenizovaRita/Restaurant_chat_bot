@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import collections
+import html as html_lib
 import logging
 import re
 from dataclasses import dataclass, field
@@ -33,7 +34,8 @@ from typing import Callable, Optional
 from dates import moscow_now, resolve_date, validate_booking_date
 from db import BookingDB, check_slot
 from llm import GenResult, PromptTooLong
-from menu import Menu, find_items, fmt_price, get_menu, tool_filter, tool_price, tool_show_business_lunch, tool_show_menu
+from menu import Menu, find_items, norm as menu_norm, fmt_price, get_menu, tool_filter, tool_price, tool_show_business_lunch, tool_show_menu
+from menu_router import BEST_RE, REC_RE, _same, _tokens, detect_filter, note_shown, route
 from slots import extract as extract_slots
 from protocol import DialogHistory, Reply, TOOLS_WITH_RESULT, expects_answer, parse_reply, sanitize_user_text, validate_action
 
@@ -50,11 +52,60 @@ NEED = {"call_booking_time_agent": ("DATE", "TIME"), "call_free_tables_agent": (
         "book_table": ("DATE", "TIME", "GUESTS", "NAME")}
 CLAIM_BOOKED = re.compile(r"бронь (?:подтвержден|оформлен|создан)|столик забронирован|забронировал[аи]? (?:для вас|столик)")
 CLAIM_CANCELLED = re.compile(r"бронь (?:отменен|отменён|снят)")
-CLAIM_EXISTS = re.compile(r"у вас (?:уже )?есть (?:активная )?бронь")
+CLAIM_EXISTS = re.compile(r"у (?:вас|нас) (?:уже )?есть (?:активная )?бронь")
 TIME_SAID = re.compile(r"\d{1,2}:\d{2}|(?<![\w])(?:в|к|на|до)\s+\d{1,2}(?![\d:.\-/])(?!\s*(?:человек|чел|гост|персон|янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек))"
                        r"|утра|вечера|часов|час(?:а|у)?\b|полдень|полноч")
 OK_LEAD = {"готово", "отлично", "конечно", "хорошо", "спасибо", "супер", "замечательно", "прекрасно", "всё", "все", "итак",
            "принято", "понял", "записал", "увы", "к", "извините", "простите", "да", "нет", "сейчас", "секунду", "минутку"}
+ABORT_BOOKING = re.compile(r"(?:не (?:надо|нуж\w+|хочу|буду|планирую|собираюсь)|передумал\w*)(?:\s+\w+)?\s+(?:брон|стол|запис|резерв)"
+                           r"|(?:брон\w*|стол\w*)\s+(?:уже\s+)?не\s+(?:надо|нуж\w+)")
+ABORT_SHORT = re.compile(r"(?:(?:ой|ну|да|нет|ладно|все|я|уже)\s+)*(?:не надо|не нужно|не хочу|передумал\w*|отбой|стоп|забудь|забей|не важно|неважно)"
+                         r"(?:\s+(?:уже|больше|спасибо|пожалуйста))*")      # на входе — текст без знаков препинания и «ё»
+# «У вас есть мидии?», «А с рыбой?», «Какой у вас кофе?» — наличие блюда решает код по menu.json, а не модель
+AVAIL = (re.compile(r"\bесть\b(?:\s+ли)?(?:\s+у\s+вас)?\s+(.+)$"),
+         re.compile(r"^(?:а\s+)?(?:(?:что|какие|какой|какая|какое|блюда|блюдо|еще)\s+)*(?:с|со|из)\s+(.+)$"),
+         re.compile(r"^(?:а\s+)?(?:какой|какая|какое|какие)\s+(?:у\s+вас\s+)?(.+?)(?:\s+у\s+вас)?$"))
+AVAIL_STOP = {"вас", "есть", "что", "какой", "какая", "какое", "какие", "еще", "нибудь", "можно", "пожалуйста", "для", "нас", "мне", "вот"}
+# не блюдо (услуги, цены, часы) — вопрос не про наличие блюда: отвечает модель
+AVAIL_SKIP = ("бизнес", "ланч", "обед", "доставк", "парков", "стол", "мест", "вайфай", "wifi", "туалет", "детск", "веранд", "террас",
+              "скидк", "акци", "оплат", "налич", "карт", "самовывоз", "музык", "зал", "брон", "свобод", "цен", "стоим", "дешев", "дорог",
+              "работ", "час", "адрес", "телефон", "меню", "порци", "размер", "калор", "состав", "аллерг", "глютен", "лактоз",
+              "мног", "выбор", "вариант", "новин", "популярн", "рекоменд", "хит", "рейтинг", "отзыв", "оценк", "сайт", "соцсет",
+              "инстаграм", "телеграм", "владел", "основан", "истори", "повар", "шеф", "кухн", "ресторан", "персонал", "официант",
+              "график", "расписан", "сотрудник")
+# общие слова-категории: в поиске не участвуют («ролл Калифорния» -> ищем «калифор»); если кроме них ничего нет — «какие есть роллы?» -> show_menu
+AVAIL_GENERIC = ("блюд", "еда", "еду", "напит", "десерт", "закуск", "горяч", "основн", "суп", "салат", "ролл", "суш", "лапш", "остр",
+                 "сладк", "вегет", "веган", "постн")
+AVAIL_MAX = 5
+CHECK_BOOKING2 = re.compile(r"(?:мо[яюиеё]|моих)\s+(?:активн\w+\s+)?брон\w*|у меня\s+(?:\w+\s+){0,2}брон\w*|(?:^|\s)есть\s+(?:ли\s+)?(?:активн\w+\s+)?брон\w*$")
+NOT_CHECK = re.compile(r"отмен|перенес|перенос|измен|удал|заброн|хочу|нужн|сдела|оформ|нов[уы]ю|нов[ыо]е|свободн|\d")
+BARE_YES = ("да", "ага", "угу", "ок", "окей", "давай", "давайте", "конечно")
+OFFER_BOOK = re.compile(r"(?:хотите|помогу|могу|желаете).{0,50}(?:брон|столик)|(?:брон|столик).{0,50}(?:хотите|помогу|желаете)")
+BOOK_ASK = "Отлично! Подскажите, пожалуйста, на какую дату, на какое время, сколько человек будет и на чьё имя оформить бронь?"
+HELP_ASK = ("Чем могу помочь? Могу рассказать про меню, цены, бизнес-ланчи, адрес и часы работы, а также забронировать столик.")
+NO_INFO = re.compile(r"скидк|акци[ияюей]\b|акции|бонус|лояльн|промокод|купон|кэшбэк|кешбэк|сертификат|абонемент")
+NO_INFO_TEXT = ("К сожалению, у меня нет информации о скидках, акциях и бонусных программах. "
+                "Уточните, пожалуйста, у администратора ресторана. Могу подсказать по меню, ценам или помочь с бронью.")
+GROUND_OK = re.compile(r"какие|какой|какая|какое|что у вас|покажи|расскажи|подскажи|что.нибудь|предлож|посовет")   # список/совет — любые блюда уместны
+# просьбы, которых бот не умеет: набор под бюджет, заказ и доставка еды (он только отвечает про меню и бронирует столики)
+UNSUPPORTED = re.compile(r"(?:собер|состав|подбер|набер|сформир|скомпону|рассчита|посчита)\w* (?:\w+ )?(?:обед|ужин|завтрак|сет|набор|комплекс|заказ|меню|счет|чек|блюд)"
+                         r"|(?:оформ|сдела|прим)\w* (?:\w+ )?заказ|(?:дост(?:ав|ави)|привез|принес)\w*|заказ\w* (?:\w+ )?(?:доставк|на дом|с собой)")
+UNSUPPORTED_TEXT = ("К сожалению, я так не умею: не подбираю наборы под бюджет и не принимаю заказы. "
+                    "Могу рассказать про меню и цены, подсказать блюда, назвать бизнес-ланчи или забронировать столик.")
+CAPS_WORDS = re.compile(r"что (?:ты|вы) (?:умеешь|умеете|можешь|можете)|чем (?:ты |вы )?(?:можешь|можете|поможешь|поможете)|что ты за бот|(?:^| )помощь(?: |$)")
+CAPS_TEXT = ("Я бот ресторана YUQI. Могу рассказать про меню и цены, подсказать блюда, назвать бизнес-ланчи, адрес и часы работы, "
+             "а также забронировать, проверить или отменить бронь столика.")
+MAX_GUESTS = 6                  # больше — только через администратора, а не «столик занят»
+GUEST_LIMIT_TEXT = ("К сожалению, через бота можно забронировать столик не более чем на 6 человек. Для большой компании обратитесь, "
+                    "пожалуйста, к администратору ресторана. Если вас будет не больше 6 — подскажите, сколько человек будет?")
+# «А у меня есть бронь?» — отвечает база, а не модель (она выдумывала бронь из слов диалога)
+CHECK_BOOKING = re.compile(r"у меня (?:уже )?(?:есть )?(?:какая нибудь |активн\w+ |действующ\w+ )?брон|есть ли у меня (?:уже )?(?:активн\w+ |действующ\w+ )?брон"
+                           r"|(?:какая|какой) у меня брон|на когда у меня брон|мо[яю] брон\w+ (?:есть|на когда)"
+                           r"|(?:проверь\w*|посмотри\w*|покажи\w*|напомни\w*) (?:мне )?(?:мо[юи] |актив\w+ )?брон")
+SYNONYMS = {"лапш": ("лапш", "рамен", "ramen", "удон", "udon", "соба", "soba", "фунчоз", "вок"),
+            "рыб": ("рыб", "лосос", "семг", "тунец", "тунц", "угор", "угр", "форел", "сибас", "окун", "скумбри"),   # «А с рыбой?»
+            "морепрод": ("креветк", "мидии", "мидий", "кальмар", "осьминог", "гребеш", "краб", "устриц"),
+            "мяс": ("говяд", "свинин", "курин", "кури", "утк", "утин", "баранин", "бекон", "стейк")}
 YES = ("да", "ага", "угу", "конечно", "подтверждаю", "верно", "давай", "давайте", "ок", "окей")
 KEEP_EXCHANGES = 2          # после завершённого ответа модель видит 2 прошлых обмена (если контекст ей помогает, см. _turn)
 WEEKDAYS = {"понедельник": 1, "вторник": 1, "сред": 1, "четверг": 1, "пятниц": 1, "суббот": 0, "воскресен": 0, "выходн": 0, "будн": 1}
@@ -104,6 +155,7 @@ class Session:
     last_slots: dict = field(default_factory=dict)  # то же только из последней реплики
     booking_ok: bool = False        # гость действительно говорит о брони (проверено один раз за разговор)
     ctx_closed: bool = False        # прошлый вопрос закрыт: контекст — только подсказка, модель может начать с чистого листа
+    menu_ctx: dict = field(default_factory=dict)    # что гость только что увидел из меню («а он острый?», «давай другое», «а почему?») — для menu_router
     user_texts: list = field(default_factory=list)   # реплики гостя в текущем разговоре (проверка имени и числа гостей)
 
     def reset(self) -> None:
@@ -114,6 +166,7 @@ class Session:
         self.booking_ok = False
         self.ctx_closed = False
         self.user_texts = []
+        self.menu_ctx = {}
 
     def close_dialog(self) -> None:
         """Вопрос закрыт: в истории остаются только последние KEEP_EXCHANGES обменов (контекст для «а в выходные?»)."""
@@ -126,13 +179,14 @@ class Session:
 class Orchestrator:
     def __init__(self, llm, booking_db: BookingDB, *, menu: Optional[Menu] = None, min_logprob: Optional[float] = -1.5,
                  session_ttl_min: int = 30, max_tool_steps: int = 6, now_fn: Callable[[], datetime] = moscow_now,
-                 confirm_booking: bool = True, grounding: bool = True, context_choice: bool = True, **_old_flags) -> None:
+                 confirm_booking: bool = True, grounding: bool = True, context_choice: bool = True, use_menu_router: bool = True, **_old_flags) -> None:
         """llm — объект с async agenerate(prompt) -> GenResult (llm.LLM).
         min_logprob — порог уверенности модели; ниже -> «не понял». None отключает проверку.
         confirm_booking — перед записью брони гость подтверждает данные «да».
         grounding — проверки брони кодом (имя из слов гостя, бронь только по просьбе, сверка слов модели с базой)."""
         self.llm, self.db, self.menu = llm, booking_db, menu
         self.confirm_booking, self.grounding, self.context_choice = confirm_booking, grounding, context_choice
+        self.use_menu_router = use_menu_router        # вопросы про меню сначала разбирает menu_router (код по menu.json); False — если route() уже вызывается снаружи
         self.min_logprob, self.ttl_min, self.max_tool_steps, self.now = min_logprob, session_ttl_min, max_tool_steps, now_fn
         self._sessions: dict[int, Session] = {}
         self.stats = collections.Counter()           # сколько ответов дала модель, а сколько — запасной ответ
@@ -158,19 +212,46 @@ class Orchestrator:
     async def handle_text(self, chat_id: int, text: str, user_name: Optional[str] = None, on_progress=None) -> TurnResult:
         """on_progress — async-функция(Message): реплики модели перед инструментом («Проверяю время.») уходят гостю сразу."""
         sess = self._session(chat_id)
-        async with sess.lock:                                            # сообщения одного чата — по очереди
+        async with sess.lock:                                            
             now = self.now()
             if sess.last_active and (now - sess.last_active).total_seconds() > self.ttl_min * 60:
-                sess.reset()                                             # диалог «остыл»
+                sess.reset()                                             
             sess.last_active = now
             clean = sanitize_user_text(text) or "?"
+            
+            # --- быстрый перехват отказа от бронирования в процессе ---
+            # «не хочу бронировать» — отказ сам по себе; короткое «уже не надо», «передумал», «отбой» — только если шла бронь
+            norm = self._norm(clean)
+            is_abort = ABORT_BOOKING.search(norm) or (ABORT_SHORT.fullmatch(norm) and self._booking_in_progress(sess))
+
+            if is_abort:
+                sess.reset() # Сбрасываем все собранные данные
+                res = TurnResult([Message("Хорошо, понял. Если понадоблюсь — обращайтесь!")], source="код: отказ от брони")
+                
+                # Запоминаем для истории, чтобы бот не повторялся потом
+                sess.prev_msgs = [m.text for m in res.messages]
+                sess.prev_raws, sess.prev_user = set(), clean.lower()
+                self.stats[res.source] += 1
+                return res
+            # ----------------------------------------------------------------------
+
             sess.user_texts = (sess.user_texts + [clean])[-8:]
+            # --- «есть ли блюдо X» решает код, а не модель (она выдумывает блюда, «кофе есть» без кофе и т.п.) ---
+            if not sess.pending_book:
+                res = await self._code_answer(chat_id, sess, clean, norm)
+                if res:
+                    return res
             expecting = self._expecting(sess)
             sess.last_slots = extract_slots(clean, now.date(), expecting)
             if expecting != "time" and not TIME_SAID.search(clean.lower()):
                 sess.last_slots.pop("time", None)                        # «нас будет 4» — это гости, а не 16:00
             if len(sess.last_slots.get("name", "")) < 3:
                 sess.last_slots.pop("name", None)                        # «Не», «Да» — не имена
+            g = sess.last_slots.get("guests")
+            if g and int(g) > MAX_GUESTS and not sess.pending_book and (self._booking_in_progress(sess) or BOOKING_WORDS.search(norm)):
+                sess.last_slots.pop("guests")                            # «12 человек» — не «столик занят», а лимит бронирования
+                sess.slots.update(sess.last_slots)
+                return self._direct(sess, clean, GUEST_LIMIT_TEXT, "код: больше 6 гостей", close=False)
             sess.slots.update(sess.last_slots)
             if sess.pending_book:
                 res = await self._confirm(chat_id, sess, clean, user_name, on_progress)
@@ -205,7 +286,7 @@ class Orchestrator:
                 fresh_prompt = h.prompt_for_user(user_text)
                 fresh = await self.llm.agenerate(fresh_prompt)
             except PromptTooLong:
-                saved, with_ctx, fresh = [], None, None
+                saved, with_ctx, fresh, h.done = [], None, None, []         # контекст слишком длинный — начинаем с чистого листа
                 fresh_prompt = h.prompt_for_user(user_text)
             if with_ctx and self._score(with_ctx, sess, user_text, ctx=True) > self._score(fresh, sess, user_text):
                 h.done, first = saved, with_ctx
@@ -222,7 +303,13 @@ class Orchestrator:
             return float("-inf")
         r = parse_reply(gen.text)
         if ctx and r.raw.strip() in sess.prev_raws and user_text.lower() != sess.prev_user:
-            return float("-inf")    # с контекстом модель повторила прошлый ответ на другой вопрос («А есть харчо?» -> снова удон)
+            return float("-inf")
+            
+        # Блокируем выбор контекста, если модель пытается начать бронь обычным текстом без разрешения
+        if not r.has_action and self.grounding and not self._booking_wanted(sess):
+            if re.search(r"какую дату|какое время|сколько (человек|гостей)|чьё имя|оформить бронь|(дата|время|гостей|имя) —", r.text.lower()):
+                return float("-inf")
+                
         if self._problem(gen, r) or (self.grounding and r.action in BOOKING_TOOLS and not self._booking_wanted(sess)) \
                 or (r.action == "cancel_booking" and not sess.cancel_armed) \
                 or (r.action == "call_price_agent" and not self._item_said(sess.user_texts if ctx else [user_text], r.params["ITEM"])):
@@ -249,12 +336,27 @@ class Orchestrator:
                 text = reply.text
                 if "Продолжим бронь" in text and not h.done:
                     text = text.split("Продолжим бронь")[0].strip() or text   # модель «вспомнила» бронь, которой нет
+                text = re.sub(r"(«[^»]+»[^.«]*?) или \1", r"\1", text)        # «X или X» — модель повторила одно и то же
                 text = self._lunch_day(user_text, text)
                 if "не по теме" in text:
-                    text = self._dish_on_menu(user_text) or re.sub(r"^Да, это", "Извините, это", text)             # «А у вас есть фунчоза?» — блюдо есть в меню
-                if self.grounding and re.match(r"(Понял|Записал|Принял):", text) and not self._ack_ok(sess, text):
-                    text = self._ask_missing(sess, [f[0] for f in FIELDS if f[1] not in sess.slots]) or text   # не верим цифрам модели
+                    text = self._dish_on_menu(user_text) or re.sub(r"^Да, это", "Извините, это", text)
+                
+                if self.grounding:
+                    is_booking_talk = re.search(r"какую дату|какое время|сколько (человек|гостей)|чьё имя|оформить бронь", text.lower())
+                    has_facts = re.search(r"(дата|время|гостей|имя) — ", text.lower())
+                    
+                    # 1. Если модель заговорила о брони (или выдумывает факты), а гость этого не просил -> честное "не понял"
+                    if (is_booking_talk or has_facts) and not self._booking_wanted(sess):
+                        return self._fallback(sess, out, f"chat={chat_id}: модель начала бронь в тексте без просьбы гостя: {reply.raw!r}")
+                        
+                    # 2. Если бронь запрошена, но модель галлюцинирует конкретные цифры (или пишет "Понял/Записал")
+                    if (has_facts or re.match(r"(Понял|Записал|Принял):", text)) and not self._ack_ok(sess, text):
+                        text = self._ask_missing(sess, [f[0] for f in FIELDS if f[1] not in sess.slots]) or text   # не верим цифрам модели
+                
                 out.messages.append(Message(text))
+                if self.grounding and self.use_menu_router and not self._dishes_grounded(sess, user_text, text):
+                    return self._fallback(sess, out, f"chat={chat_id}: модель назвала блюдо, о котором гость не спрашивал: {reply.raw!r}")
+                self._note_shown(sess, None, text)
                 h.commit(reply.raw)
                 if not expects_answer(reply):
                     sess.close_dialog()
@@ -309,6 +411,7 @@ class Orchestrator:
             if reply.text:
                 out.messages.append(Message(reply.text))
             self._run_terminal(chat_id, user_name, user_text, reply, out)
+            self._note_shown(sess, reply)
             h.commit(reply.raw)
             sess.close_dialog()
             return out
@@ -366,11 +469,187 @@ class Orchestrator:
         words = [w for w in re.findall(r"[а-яёa-z]{3,}", item.lower().replace("ё", "е"))]
         return not words or any(w[:4] in said for w in words)
 
+    def _dishes_grounded(self, sess: Session, user_text: str, text: str) -> bool:
+        """Блюда в «ёлочках» из ответа модели: гость их назвал, они были только что показаны, или гость просил совет/список.
+        Иначе модель подсовывает «любимое» блюдо (в датасете это YUQI Dragon Roll) невпопад — лучше честное «не понял»."""
+        try:
+            named = {menu_norm(x) for x in re.findall(r"«([^»]+)»", text)}
+            if not named or self._booking_in_progress(sess):
+                return True
+            t = menu_norm(user_text)
+            if REC_RE.search(t) or GROUND_OK.search(t) or BEST_RE.search(t) or detect_filter(user_text):
+                return True
+            shown, q = set(sess.menu_ctx.get("names") or ()), [w for w in _tokens(user_text) if len(w) >= 3]
+            for it in self._menu().items:
+                names = [it.name, *it.aliases]
+                if not any(menu_norm(n) in named or any(menu_norm(n) in x for x in named) for n in names):
+                    continue
+                if it.name in shown or any(_same(a, b) for a in q for n in names for b in _tokens(n) if len(b) >= 3):
+                    continue
+                return False
+            return True
+        except Exception:
+            log.exception("не удалось проверить блюда в ответе модели")
+            return True
+
+    def _note_shown(self, sess: Session, reply: Optional[Reply], text: str = "") -> None:
+        """Запоминаем для menu_router, что гость увидел (меню, фильтр, цена, блюда в ответе модели): «а он острый?», «давай другое»."""
+        if not self.use_menu_router:
+            return
+        try:
+            m, p = self._menu(), reply.params if reply else {}
+            a = reply.action if reply else None
+            note_shown(sess.menu_ctx, m, category=p.get("CATEGORY") if a == "show_menu" else None,
+                       flt=p.get("FILTER") if a == "call_menu_filter_agent" else None,
+                       item=p.get("ITEM") if a == "call_price_agent" else None, lunch=a == "show_business_lunch", text=text)
+        except Exception:
+            log.exception("не удалось запомнить показанное меню")
+
+    @staticmethod
+    def _norm(text: str) -> str:
+        """Нижний регистр, «ё» -> «е», без знаков препинания."""
+        return " ".join(re.sub(r"[^\w\s]", " ", text.lower().replace("ё", "е")).split())
+
+    @staticmethod
+    def _stem(w: str) -> str:
+        n = len(w)
+        return w if n <= 4 else w[:3] if n <= 6 else w[:4] if n <= 8 else w[:n - 4]     # «мидии» -> «мид», «курицей» -> «кури»
+
+    async def _code_answer(self, chat_id: int, sess: Session, clean: str, norm: str) -> Optional[TurnResult]:
+        """Ответы кода без модели. Любая ошибка здесь не должна ломать бота: пишем traceback в лог и отдаём вопрос модели."""
+        try:
+            return await self._code_answer_inner(chat_id, sess, clean, norm)
+        except Exception:
+            log.exception("chat=%s: код-ответ на %r упал, вопрос уходит модели", chat_id, clean)
+            return None
+
+    async def _code_answer_inner(self, chat_id: int, sess: Session, clean: str, norm: str) -> Optional[TurnResult]:
+        """Вопросы, на которые отвечает код без модели: «есть ли у меня бронь», «есть ли блюдо X», цена, острое, совет."""
+        if (CHECK_BOOKING.search(norm) and "отмен" not in norm) or (CHECK_BOOKING2.search(norm) and not NOT_CHECK.search(norm)):
+            a = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
+            sess.cancel_armed = a is not None
+            if a:
+                text = f"У вас есть бронь: {booking_line(a.date, a.time, a.guests, a.name)}. Отменить её?"
+            else:
+                text = "Активной брони у вас сейчас нет. Если хотите забронировать столик — напишите дату, время, количество гостей и имя."
+            return self._direct(sess, clean, text, "код: проверка брони", close=a is None)      # «Отменить её?» — «Да» разберёт модель (cancel_armed уже включён)
+        if self._expecting(sess):
+            return None
+        words = norm.split()
+        if words and len(words) <= 2 and words[0] in BARE_YES and not sess.cancel_armed:   # «Отменить её?» — «Да» разбирает модель
+            last_bot = re.sub(r"<[^>]+>", "", " ".join(sess.prev_msgs)).lower()          # что бот реально отправил в прошлый ход
+            if OFFER_BOOK.search(last_bot) and "отмен" not in last_bot:
+                sess.booking_ok = True                                   # гость принял предложение оформить бронь
+                return self._direct(sess, clean, BOOK_ASK, "код: бронь", close=False)
+            if "?" not in last_bot and "отмен" not in last_bot:          # на «Да» не было вопроса — не гадаем
+                return self._direct(sess, clean, HELP_ASK, "код: меню")
+        if UNSUPPORTED.search(norm) and not BOOKING_WORDS.search(norm):
+            return self._direct(sess, clean, UNSUPPORTED_TEXT, "код: не умеет")
+        if NO_INFO.search(norm) and len(norm.split()) <= 8 and not BOOKING_WORDS.search(norm):
+            return self._direct(sess, clean, NO_INFO_TEXT, "код: нет данных")      # нет в данных бота — не выдумываем
+        if CAPS_WORDS.search(norm) and len(norm.split()) <= 8:          # «Что ты умеешь?» — не повод рекомендовать блюдо
+            return self._direct(sess, clean, CAPS_TEXT, "код: меню")
+        if self.use_menu_router:                                         # меню, цены, состав, острое, рекомендации — menu_router по menu.json
+            msgs = route(clean, self._menu(), ctx=sess.menu_ctx)
+            if msgs:
+                plain = html_lib.unescape(re.sub(r"<[^>]+>", "", msgs[0])).strip()
+                res = self._direct(sess, clean, msgs[0], "код: меню", html=True, hist=plain[:400])
+                res.messages += [Message(t, True) for t in msgs[1:]]
+                return res
+        found = self._avail_topic(norm)
+        return self._answer_avail(sess, clean, *found) if found else None
+
+    def _direct(self, sess: Session, clean: str, text: str, source: str, close: bool = True, html: bool = False,
+                hist: Optional[str] = None) -> TurnResult:
+        """Ответ кода: попадает в историю диалога (hist — его текстом без разметки), чтобы модель видела его в следующих репликах."""
+        try:
+            sess.history.prompt_for_user(clean)
+            sess.history.commit(hist or text)
+            if close:
+                sess.close_dialog()
+        except Exception:                                                # история — только подсказка модели, ответ гостю всё равно уходит
+            log.exception("не удалось записать ответ кода в историю диалога")
+            sess.history.reset()
+        res = TurnResult([Message(text, html)], source=source)
+        sess.prev_msgs, sess.prev_raws, sess.prev_user = [text], set(), clean.lower()
+        self.stats[source] += 1
+        return res
+
+    def _all_items(self) -> list:
+        return list(self._menu().items)
+
+    def _find(self, words: list[str]) -> dict:
+        """Блюда, в названии/описании которых есть ВСЕ слова (начало слова; «рыба», «лапша» раскрываются синонимами)."""
+        items, found = self._all_items(), None
+        for w in words:
+            stems = next((v for k, v in SYNONYMS.items() if w.startswith(k)), (self._stem(w),))
+            hits = {}
+            for it in items:
+                hay = " ".join([it.name, *it.aliases, it.description or ""]).lower().replace("ё", "е")
+                if not it.business_lunch and any(re.search(rf"(?<![а-яa-z]){re.escape(st)}", hay) for st in stems):
+                    hits[it.name] = it
+            found = hits if found is None else {k: v for k, v in found.items() if k in hits}
+        return found or {}
+
+    @classmethod
+    def _avail_topic(cls, norm: str) -> Optional[tuple[list[str], bool]]:
+        """«у вас есть мидии?», «а с рыбой?» -> (['мидии'], True); иначе None (это не вопрос про блюдо).
+        Второе значение: можно ли отвечать «не нашёл». «Какой у вас рейтинг?» — не про блюдо, и если в меню ничего нет,
+        отвечать «нет такого блюда» нельзя: пусть отвечает модель."""
+        if len(norm.split()) > 8 or BOOKING_WORDS.search(norm):
+            return None
+        for rx in AVAIL:
+            m = rx.search(norm)
+            if m:
+                topic, miss_ok = m.group(1), rx is not AVAIL[2]
+                break
+        else:
+            return None
+        if re.search(r"\d", topic):
+            return None
+        words = [w for w in re.findall(r"[a-zа-я]{3,}", topic) if w not in AVAIL_STOP]
+        if any(w.startswith(AVAIL_SKIP) for w in words):
+            return None
+        words = [w for w in words if not w.startswith(AVAIL_GENERIC)]
+        return (words, miss_ok) if words else None
+
+    def _answer_avail(self, sess: Session, clean: str, words: list[str], miss_ok: bool) -> Optional[TurnResult]:
+        found = self._find(words)
+        topic = " ".join(words)
+        if found:
+            items = list(found.values())
+            lines = [f"• «{it.name}» — {fmt_price(it.price)}" for it in items[:AVAIL_MAX]]
+            more = f"\nИ ещё: {len(items) - AVAIL_MAX}." if len(items) > AVAIL_MAX else ""
+            text = "Да, в меню есть:\n" + "\n".join(lines) + more
+        elif miss_ok:
+            text = f"Блюд и напитков со словом «{topic}» в нашем меню не нашёл. Могу подсказать, что есть в меню."
+        else:
+            return None
+        log.info("вопрос про блюдо %r решил код: найдено %d", topic, len(found or {}))
+        return self._direct(sess, clean, text, "код: меню")
+
+    def _booking_in_progress(self, sess: Session) -> bool:
+        """Шла ли бронь до этой реплики: код уже что-то собрал, или бот / гость в последних репликах говорили о брони.
+        Вопрос бота может быть сразу про всё («Напишите дату, время, количество человек и имя») — _expecting его не узнает."""
+        if sess.booking_ok or sess.slots or sess.pending_book or self._expecting(sess):
+            return True
+        last_bot = sess.history.done[-1].split("-> Bot:")[-1] if sess.history.done else ""
+        prev_user = sess.user_texts[-1] if sess.user_texts else ""      # реплика гостя ДО текущей (текущая ещё не добавлена)
+        return bool(BOOKING_WORDS.search(f"{last_bot} {prev_user}".lower()))
+
     def _booking_wanted(self, sess: Session) -> bool:
         """Гость сам говорит о брони: слова «бронь/столик/записаться» или хотя бы две детали (дата, время, гости, имя)."""
         last = sess.user_texts[-1] if sess.user_texts else ""
-        return (sess.booking_ok or bool(BOOKING_WORDS.search(" ".join(sess.user_texts).lower())) or len(sess.slots) >= 2
-                or ("date" in sess.last_slots and "?" not in last and len(last.split()) <= 3))     # «25 октября»
+        said = " ".join(sess.user_texts).lower()
+        
+        # Гость только что сказал, что не хочет бронировать (старые реплики не считаем: иначе после «уже не надо»
+        # о чём-то другом бронь была бы заблокирована до конца разговора)
+        if ABORT_BOOKING.search(" ".join(re.sub(r"[^\w\s]", " ", last.lower().replace("ё", "е")).split())):
+            sess.booking_ok = False 
+            return False
+            
+        return (sess.booking_ok or bool(BOOKING_WORDS.search(said)) or len(sess.slots) >= 2
+                or ("date" in sess.last_slots and "?" not in last and len(last.split()) <= 3))
 
     def _ground(self, sess: Session, reply: Reply) -> list[str]:
         """Подставляет в команду модели дату/время/гостей/имя из слов гостя (их нашёл код).
@@ -385,7 +664,7 @@ class Orchestrator:
         model_hour = re.match(r"(\d{1,2})", p.get("TIME", "")) or None
         vals = {"DATE": s.get("date") or (p.get("DATE") if p.get("DATE") in tool_dates else None),
                 "TIME": s.get("time") or (p.get("TIME") if model_hour and re.search(rf"(?<!\d){int(model_hour.group(1))}(?!\d)", said) else None),
-                "GUESTS": s.get("guests") or (p.get("GUESTS") if re.search(rf"(?<!\d){p.get('GUESTS')}(?!\d)", said) else None),
+                "GUESTS": s.get("guests") or (p.get("GUESTS") if p.get("GUESTS") and re.search(rf"(?<!\d){re.escape(p['GUESTS'])}(?!\d)", said) else None),
                 "NAME": s.get("name") or (self._name_from_user(sess, p["NAME"]) if p.get("NAME") else None)}
         if vals["NAME"] and vals["NAME"].lower()[:4] not in said:
             vals["NAME"] = None
@@ -477,6 +756,15 @@ class Orchestrator:
         a = sess.cancelled if gone else await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
         if not a:
             return
+        if "booked" in kinds and res.messages and not res.messages[-1].html:
+            # итог брони пишет код: модель путала формат и искажала имя («Имя:ана» вместо «Анатолий»)
+            line = booking_line(a.date, a.time, a.guests, a.name)
+            final = f"Готово, бронь подтверждена: {line}. Ждём вас в YUQI!"
+            if res.messages[-1].text != final:
+                log.info("chat=%s: итог брони написан кодом, модель сказала: %r", chat_id, res.messages[-1].text)
+            res.messages[-1] = Message(final)
+            res.source = "код: проверка брони"
+            return
         for i, m in enumerate(res.messages):
             t = m.text
             if m.html or not re.search(r"\d\d\.\d\d\.\d{4}|[Ии]мя", t):
@@ -484,7 +772,7 @@ class Orchestrator:
             bad = (any(d != a.date for d in re.findall(r"\d\d\.\d\d\.\d{4}", t))
                    or any(x != a.time for x in re.findall(r"(?<!\d)\d\d:\d\d", t))
                    or any(int(g) != a.guests for g in re.findall(r"(\d+) (?:человек|гост)|человек: (\d+)", t) for g in g if g)
-                   or any(n != a.name for n in re.findall(r"[Ии]мя:? ([А-ЯЁA-Z][а-яёa-z\-]+)", t)))
+                   or any(n.lower() != a.name.lower() for n in re.findall(r"имя\s*[:—-]?\s*([а-яёa-z\-]+)", t, re.I)))
             lead = re.match(r"([А-ЯЁ][а-яё]+), ", t)
             if lead and lead.group(1) != a.name and lead.group(1).lower() not in OK_LEAD:
                 t = t[lead.end():]
@@ -555,6 +843,8 @@ class Orchestrator:
                 return f"invalid_time | REASON: {problem.code}", None
             return None, problem.text
 
+        if a in ("call_free_tables_agent", "book_table") and int(p["GUESTS"]) > MAX_GUESTS:
+            return None, GUEST_LIMIT_TEXT                                # не «столик занят», а честная причина
         if a == "call_free_tables_agent":
             problem = check_slot(p["DATE"], p["TIME"], now)
             if problem:

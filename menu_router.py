@@ -12,17 +12,30 @@
 """
 from __future__ import annotations
 
+import difflib
 import html
 import random
 import re
 from typing import Optional
 
-from menu import (CATEGORY_TITLES, is_business_lunch_query, tool_show_business_lunch, Item, Menu, _item_line, _same, _tokens, fmt_price, find_items, norm,
+from menu import (CATEGORY_TITLES, is_business_lunch_query, tool_show_business_lunch, Item, Menu, _item_line, _tokens, fmt_price, find_items, norm,
                   split_message, tool_filter, tool_price, tool_show_menu)
 
+def _same(a: str, b: str) -> bool:
+    """Слова совпадают с точностью до окончания и опечатки в конце: филадельфия/филадельфию, гедза/гедзы, матча/матчу."""
+    if a == b:
+        return True
+    if min(len(a), len(b)) >= 5:
+        return a[:5] == b[:5] or (abs(len(a) - len(b)) <= 1 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.8)
+    if min(len(a), len(b)) == 4 and abs(len(a) - len(b)) <= 1:          # чука/чуку
+        return a[:3] == b[:3]
+    short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+    return len(short) >= 2 and long_.startswith(short) and len(long_) - len(short) <= 2
+
+
 CATEGORY_STEMS = {
-    "appetizers": ("закуск",), "salads": ("салат",), "sushi_rolls": ("ролл", "суши", "сашими", "маки"),
-    "soups": ("суп", "бульон"), "noodles": ("лапш", "фунчоз"),
+    "appetizers": ("закус",), "salads": ("салат",), "sushi_rolls": ("ролл", "суши", "сашими", "маки"),
+    "soups": ("суп", "бульон"), "noodles": ("лапш",),
     "main_courses": ("горяч", "основн"), "street_food": ("стрит", "уличн"),
     "desserts": ("десерт", "сладк", "торт", "мороженое", "пирожн"), "drinks": ("напит", "чай", "кофе", "лимонад", "сок"),
 }
@@ -30,7 +43,9 @@ REC_RE = re.compile(r"посовет|порекоменд|рекоменд|чт�
                     r"на что обратить|что.{0,15}(?:популярн|хит)|чем (?:перекус|поужин)|что у вас вкусн|не могу выбрать|"
                     r"что.{0,12}из меню|что.{0,12}на (?:ужин|обед|ланч|завтрак)")
 PRICE_RE = re.compile(r"сколько (?:он |она |оно |они )?(?:стоит|стоят|будет стоить)|цена|цены|почем|стоимост|по чем")
-COMPOSE_RE = re.compile(r"из чего|состав|что входит|что (?:там )?в (?:составе|нем|ней|нём)|что внутри|из каких")
+CONTAINS_RE = re.compile(r"входит|входят|содержит|\bесть\b|кладут|добавля|положен|используют")
+CONTAINS_STOP = ("входит", "входят", "содержит", "кладут", "добавляют", "добавляете", "положен", "используют", "тоже", "вообще", "как", "нет", "все", "вам", "нам", "это")
+COMPOSE_RE = re.compile(r"из чего|состав|что (?:\w+ )?входит|что (?:там )?в (?:составе|нем|ней|нём)|что (?:там )?внутри|из каких|что (?:там )?в\s+(?!меню|наличи|вашем|этом|ваш)\w+")
 LIST_RE = re.compile(r"какие|какая|какой|какое|что у вас|есть ли|есть у вас|у вас есть|покажи|расскажи|что за|что.нибудь|"
                      r"подскажи|хочу|хотел|можно|а .*есть|^есть\b|найди|предлож|что такое|подробнее")
 REF_RE = re.compile(r"оттуда|отсюда|из перечн|из данн|из тех|из выбранн|из найденн|из них|из эт(?:их|ого|ой)|из списка|из перечисленн|из предложенн|из показанн|из того|среди них|из вышеперечисленн")
@@ -92,7 +107,9 @@ def _category_of(tokens: list[str]) -> Optional[str]:
 def _dish_hits(text: str, menu: Menu) -> list[Item]:
     """Блюда, у которых в названии/псевдонимах есть слова из вопроса (удоны -> Удон с курицей; «Том Ям» — два коротких слова)."""
     cat_stems = tuple(s for ss in CATEGORY_STEMS.values() for s in ss)
-    all_q = [w for w in _tokens(text) if w not in STOPWORDS and not FILTER_TOKEN_RE.match(w) and not w.startswith(cat_stems)]
+    name_toks = {t for it in _regular(menu) for n in (it.name, *it.aliases) for t in _tokens(n)}
+    all_q = [w for w in _tokens(text) if w not in STOPWORDS and not FILTER_TOKEN_RE.match(w)
+             and (not w.startswith(cat_stems) or w in name_toks)]               # «лимонад» — и раздел, и блюдо: слово из названия — это блюдо
     q = [w for w in all_q if len(w) >= 4]                               # «лапша», «роллы» — это раздел, а не блюдо
     hits = []
     for it in _regular(menu):
@@ -140,7 +157,7 @@ def _recommend(text: str, menu: Menu, rng: random.Random, flt: Optional[str], ct
         pool = _apply([i for i in _regular(menu) if i.category == "drinks"], flt)
     elif re.search(r"сытн|ужин|обед|голодн|плотн", t) and not cat:
         pool = [i for i in pool if i.category in ("noodles", "main_courses", "soups")] or pool
-    elif re.search(r"перекус|легк|закуск", t) and not cat:
+    elif re.search(r"перекус|легк|закус", t) and not cat:
         pool = [i for i in pool if i.category in ("appetizers", "salads", "street_food")] or pool
     if not pool and flt == "vegan":
         veg = _apply([i for i in _regular(menu) if i.category not in ("drinks", "desserts")], "vegetarian")
@@ -199,7 +216,7 @@ NOT_ON_MENU = {  # блюда, которых у нас нет (азиатска
     "картошк": ("картошки", None), "картофел": ("картофеля", None), "цезар": ("салата «Цезарь»", "salads"), "оливье": ("оливье", "salads"),
     "плов": ("плова", None), "котлет": ("котлет", None), "блин": ("блинов", "desserts"), "шаурм": ("шаурмы", None), "хот-дог": ("хот-догов", None),
 }
-PRONOUN_RE = re.compile(r"(?<!\w)(?:он|она|оно|они|его|её|ее|нём|нем|ней|них)(?!\w)")
+PRONOUN_RE = re.compile(r"(?<!\w)(?:он|она|оно|они|его|её|ее|нём|нем|ней|них|туда)(?!\w)")
 OPINION_RE = re.compile(r"вкусн|нравит|понравит|стоит (?:ли )?(?:попробовать|заказать|брать|взять)|хорош|советуеш|рекомендуеш")
 BEST_RE = re.compile(r"самое вкусн|самый вкусн|самая вкусн|что вкуснее|вкуснее всего|самое популярн|что лучше всего|чем славит|ваш хит|ваши хиты|лучшее у вас|лучшее в меню")
 SPICY_Q_RE = re.compile(r"остр|пряно|пикант|жгуч")
@@ -257,6 +274,20 @@ def _answer_dish(items: list[Item], t: str, with_text: bool, rng=random) -> str:
         parts.append(" ".join(sents))
     tail = rng.choice(["", "", "Хотите, расскажу про что-нибудь ещё?", "Если нужно, подскажу и другие блюда."])
     return "\n\n".join(parts) + (f"\n\n{tail}" if tail else "")
+
+
+def _compose_answer(items: list[Item]) -> str:
+    """Состав блюда — только то, что написано в меню (описание, порция); цену не добавляем, об этом не спрашивали."""
+    e, parts = html.escape, []
+    for it in items[:3]:
+        d = (it.description or "").strip().rstrip(".")
+        if d and len(d) > 1 and d[0].isupper() and d[1].islower():
+            d = d[0].lower() + d[1:]
+        if d:
+            parts.append(f"<b>{e(it.name)}</b> — {e(d)}." + (f" Порция — {e(it.weight)}." if it.weight else ""))
+        else:
+            parts.append(f"Для «<b>{e(it.name)}</b>» в меню нет описания состава. Уточните, пожалуйста, у официанта.")
+    return "\n\n".join(parts)
 
 
 def _why_for_items(items: list[Item], intro: str) -> str:
@@ -493,14 +524,36 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
         if sig:
             return tool_show_menu("signature", menu)
 
+    # «В матчу входит молоко?» — есть ли ингредиент в описании названного блюда (честно: только по тексту меню)
+    if CONTAINS_RE.search(t) and not COMPOSE_RE.search(t):
+        found = _dish_hits(text, menu)
+        if found and len(found) <= 2:
+            name_tokens = [n for it in found for n in _tokens(it.name)]
+            ing = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in CONTAINS_STOP
+                   and not any(_same(w, n) for n in name_tokens)]
+            if ing:
+                e, outs = html.escape, []
+                _remember(ctx, found, None)
+                for it in found:
+                    dt = _tokens(it.description or "")
+                    has = [w for w in ing if any(_same(w, d) for d in dt)]
+                    d = (it.description or "").rstrip(".")
+                    d = d[0].lower() + d[1:] if len(d) > 1 and d[0].isupper() and d[1].islower() else d
+                    if has and len(has) == len(ing):
+                        outs.append(f"Да, в описании «<b>{e(it.name)}</b>» это есть: {e(d)}.")
+                    else:
+                        outs.append(f"В описании «<b>{e(it.name)}</b>» этого не указано: {e(d) or 'описания нет'}. "
+                                    "Если важно (например, аллергия), уточните, пожалуйста, у официанта.")
+                return ["\n\n".join(outs)]
+
     # состав
     if COMPOSE_RE.search(t):
         found = _dish_hits(text, menu)
         if not found:
-            return None
+            return ["Не нашёл такое блюдо в меню. Напишите, пожалуйста, название точнее — подскажу состав и цену."]
         _remember(ctx, found[:3], None)
         ctx["why"] = _why_for_items(found[:3], "Я опираюсь на карточку блюда в нашем меню:")
-        return [_answer_dish(found, t, with_text=True, rng=rng)]
+        return [_compose_answer(found)]
 
     # «моти сладкий?», «рамен сытный?» — по разделу меню и описанию, честно
     if re.search(r"сладк|сытн|наед|порци|большой|большая|сладост", t):
