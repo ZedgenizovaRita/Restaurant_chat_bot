@@ -51,8 +51,8 @@ FIELDS = (("DATE", "date", "на какую дату", "дата"), ("TIME", "ti
 NEED = {"call_booking_time_agent": ("DATE", "TIME"), "call_free_tables_agent": ("DATE", "TIME", "GUESTS"),
         "book_table": ("DATE", "TIME", "GUESTS", "NAME")}
 CLAIM_BOOKED = re.compile(r"бронь (?:подтвержден|оформлен|создан)|столик забронирован|забронировал[аи]? (?:для вас|столик)")
-CLAIM_CANCELLED = re.compile(r"бронь (?:отменен|отменён|снят)")
-CLAIM_EXISTS = re.compile(r"у (?:вас|нас) (?:уже )?есть (?:активная )?бронь")
+CLAIM_CANCELLED = re.compile(r"отмен(?:ил|яю|яем|ю|им|ена|ено|ен|ён)\w*.{0,30}брон|брон\w*.{0,30}(?:отмен(?:ен|ён|ил|яю|ю|им)\w*|снят\w*|удал[её]н\w*)")
+CLAIM_EXISTS = re.compile(r"у (?:вас|нас) (?:уже )?(?:есть|забронирован\w*) (?:активн\w+ )?(?:брон\w*|стол\w*)|ваш\w* (?:активн\w+ )?брон\w+ (?:на |:|—)")
 TIME_SAID = re.compile(r"\d{1,2}:\d{2}|(?<![\w])(?:в|к|на|до)\s+\d{1,2}(?![\d:.\-/])(?!\s*(?:человек|чел|гост|персон|янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек))"
                        r"|утра|вечера|часов|час(?:а|у)?\b|полдень|полноч")
 OK_LEAD = {"готово", "отлично", "конечно", "хорошо", "спасибо", "супер", "замечательно", "прекрасно", "всё", "все", "итак",
@@ -84,6 +84,9 @@ WORD_NUMS = {"один": 1, "одна": 1, "одного": 1, "одну": 1, "д
 BUSY_CLAIM = re.compile(r"занят|нет свободн|свободных (?:столик|мест)\w* нет|нет мест|не нашлось (?:свободн|столик)|мест нет")
 ASKS = {"date": re.compile(r"какую дату|какой день|на какое число"), "time": re.compile(r"какое (?:точное )?время|во сколько"),
         "guests": re.compile(r"сколько (?:человек|гостей|вас)"), "name": re.compile(r"чьё имя|чье имя|какое имя|как вас зовут")}
+CANCEL_REQ = re.compile(r"отмен\w*\s+(?:\w+\s+){0,2}брон|брон\w*\s+(?:\w+\s+){0,2}отмен|(?:сними|снять|удали|удалить)\w*\s+(?:\w+\s+){0,2}брон"
+                        r"|не приду|не смогу (?:прийти|придти)|откаж\w+ от (?:брони|стола)")
+AFFIRM = re.compile(r"(?:^|\s)(?:да|давай|давайте|конечно|ага|угу|ок|окей|подтверждаю|отмен\w*)(?:\s|$)")
 BARE_YES = ("да", "ага", "угу", "ок", "окей", "давай", "давайте", "конечно")
 OFFER_BOOK = re.compile(r"(?:хотите|помогу|могу|желаете).{0,50}(?:брон|столик)|(?:брон|столик).{0,50}(?:хотите|помогу|желаете)")
 BOOK_ASK = "Отлично! Подскажите, пожалуйста, на какую дату, на какое время, сколько человек будет и на чьё имя оформить бронь?"
@@ -385,6 +388,17 @@ class Orchestrator:
                     sess.close_dialog()
                 return out
 
+            if reply.action == "cancel_booking":                           # «Отменяю бронь» от модели — делает код и по базе
+                confirmed = sess.cancel_armed and bool(AFFIRM.search(f" {self._norm(user_text)} "))
+                text = await self._cancel_core(chat_id, sess, confirmed)
+                out.messages.append(Message(text))
+                out.source = "код: отмена брони"
+                if text.startswith("Бронь отменена"):
+                    out.steps.append({"action": "cancel_booking", "raw": reply.raw, "result": "cancelled"})
+                h.commit(text)
+                if "Отменить её?" not in text:
+                    sess.close_dialog()
+                return out
             out.source = "модель + инструмент"
             # --- инструмент с результатом: код выполняет, модель продолжает
             if self.grounding and reply.action in BOOKING_TOOLS:
@@ -554,6 +568,25 @@ class Orchestrator:
                 return n
         return None
 
+    async def _cancel_core(self, chat_id: int, sess: Session, confirmed: bool) -> str:
+        """Отмена брони делается ТОЛЬКО здесь, по базе: показать бронь и спросить -> гость подтвердил -> cancel_active -> проверить,
+        что бронь действительно исчезла. Слова модели «Отменяю бронь» сами по себе ничего не отменяют и ничему не верим."""
+        now = self.now()
+        a = await asyncio.to_thread(self.db.active_booking, chat_id, now)
+        if not a:
+            sess.cancel_armed = False
+            return "Активной брони у вас нет — отменять нечего."
+        if not confirmed:
+            sess.cancel_armed = True
+            return f"У вас есть бронь: {booking_line(a.date, a.time, a.guests, a.name)}. Отменить её?"
+        old = await asyncio.to_thread(self.db.cancel_active, chat_id, now)
+        sess.cancel_armed, sess.cancelled = False, old or a
+        still = await asyncio.to_thread(self.db.active_booking, chat_id, now)
+        if still and (not old or (still.date, still.time) == (a.date, a.time)):
+            log.error("chat=%s: cancel_active не снял бронь %s %s (old=%r)", chat_id, a.date, a.time, old)
+            return "Не получилось отменить бронь. Обратитесь, пожалуйста, к администратору ресторана."
+        return f"Бронь отменена: {booking_line(a.date, a.time, a.guests, a.name)}."
+
     @staticmethod
     def _norm(text: str) -> str:
         """Нижний регистр, «ё» -> «е», без знаков препинания."""
@@ -574,6 +607,13 @@ class Orchestrator:
 
     async def _code_answer_inner(self, chat_id: int, sess: Session, clean: str, norm: str) -> Optional[TurnResult]:
         """Вопросы, на которые отвечает код без модели: «есть ли у меня бронь», «есть ли блюдо X», цена, острое, совет."""
+        last_bot = re.sub(r"<[^>]+>", "", " ".join(sess.prev_msgs)).lower()
+        asked_cancel = "отменить" in last_bot and "?" in last_bot            # бот только что спросил «Отменить её?»
+        if CANCEL_REQ.search(norm) and not re.search(r"заброни|нов[уы]ю|хочу брон", norm) or (
+                sess.cancel_armed and asked_cancel and len(norm.split()) <= 3 and AFFIRM.search(f" {norm} ") and not re.match(r"нет|неа", norm)):
+            confirmed = sess.cancel_armed and asked_cancel and bool(AFFIRM.search(f" {norm} "))
+            text = await self._cancel_core(chat_id, sess, confirmed)
+            return self._direct(sess, clean, text, "код: отмена брони", close="Отменить её?" not in text)
         if (CHECK_BOOKING.search(norm) and "отмен" not in norm) or (CHECK_BOOKING2.search(norm) and not NOT_CHECK.search(norm)):
             a = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
             sess.cancel_armed = a is not None
@@ -754,7 +794,8 @@ class Orchestrator:
         tool_dates = re.findall(r"Tool: RESULT: (\d\d\.\d\d\.\d{4})", " ".join(sess.history.done))
         model_hour = re.match(r"(\d{1,2})", p.get("TIME", "")) or None
         vals = {"DATE": s.get("date") or (p.get("DATE") if p.get("DATE") in tool_dates else None),
-                "TIME": s.get("time") or (p.get("TIME") if model_hour and re.search(rf"(?<!\d){int(model_hour.group(1))}(?!\d)", said) else None),
+                "TIME": s.get("time") or (p.get("TIME") if model_hour and TIME_SAID.search(said) and re.search(
+                    rf"(?<![\d.:]){int(model_hour.group(1))}(?![\d.]|\s*(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|человек|чел|гост|персон))", said) else None),
                 "GUESTS": s.get("guests") or (p.get("GUESTS") if p.get("GUESTS") and re.search(
                     rf"(?<![\d:.]){re.escape(p['GUESTS'])}(?![\d:.]|\s*(?:янв|фев|мар|апр|ма[йя]|июн|июл|авг|сен|окт|ноя|дек|час|ч\b|руб|₽))", said) else None),
                 "NAME": s.get("name") or (self._name_from_user(sess, p["NAME"]) if p.get("NAME") else None)}
@@ -895,8 +936,12 @@ class Orchestrator:
                     and a.date in m.text and a.time in m.text:
                 continue                                                 # модель верно пересказала бронь из базы
             log.warning("chat=%s: слова модели о брони не совпали с базой: %r", chat_id, m.text)
-            res.messages[i] = Message(f"Сверился с базой: у вас есть бронь — {booking_line(a.date, a.time, a.guests, a.name)}." if a else
-                                      "Сверился с базой: активной брони у вас сейчас нет.")
+            if CLAIM_CANCELLED.search(t) and "cancelled" not in results:
+                res.messages[i] = Message((f"Бронь пока не отменена — она активна: {booking_line(a.date, a.time, a.guests, a.name)}. "
+                                           "Чтобы отменить, напишите «отмени бронь».") if a else "Активной брони у вас нет — отменять нечего.")
+            else:
+                res.messages[i] = Message(f"Сверился с базой: у вас есть бронь — {booking_line(a.date, a.time, a.guests, a.name)}." if a else
+                                          "Сверился с базой: активной брони у вас сейчас нет.")
             res.source = "код: проверка брони"
 
     # ------------------------------------------------------------ проверка формы ответа
@@ -931,8 +976,7 @@ class Orchestrator:
             problem = check_slot(p["DATE"], p["TIME"], now)
             if problem is None:
                 return "time_valid", None
-            if problem.code in ("outside_hours", "past_time"):
-                return f"invalid_time | REASON: {problem.code}", None
+            sess.slots.pop("time", None)                                 # время не подошло — спросим другое; текст причины пишет код, а не модель
             return None, problem.text
 
         if a in ("call_free_tables_agent", "book_table") and int(p["GUESTS"]) > MAX_GUESTS:
@@ -941,6 +985,7 @@ class Orchestrator:
         if a == "call_free_tables_agent":
             problem = check_slot(p["DATE"], p["TIME"], now)
             if problem:
+                sess.slots.pop("time", None)
                 return None, problem.text
             old = await asyncio.to_thread(self.db.active_booking, chat_id, now)
             if old:                                                      # у гостя уже есть бронь
