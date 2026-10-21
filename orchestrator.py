@@ -81,6 +81,9 @@ CHECK_BOOKING2 = re.compile(r"(?:мо[яюиеё]|моих)\s+(?:активн\w+
 NOT_CHECK = re.compile(r"отмен|перенес|перенос|измен|удал|заброн|хочу|нужн|сдела|оформ|нов[уы]ю|нов[ыо]е|свободн|\d")
 WORD_NUMS = {"один": 1, "одна": 1, "одного": 1, "одну": 1, "двое": 2, "два": 2, "две": 2, "двоих": 2, "вдвоем": 2, "трое": 3, "три": 3, "троих": 3,
              "втроем": 3, "четверо": 4, "четыре": 4, "четверых": 4, "вчетвером": 4, "пятеро": 5, "пять": 5, "шестеро": 6, "шесть": 6, "семеро": 7, "семь": 7}
+BUSY_CLAIM = re.compile(r"занят|нет свободн|свободных (?:столик|мест)\w* нет|нет мест|не нашлось (?:свободн|столик)|мест нет")
+ASKS = {"date": re.compile(r"какую дату|какой день|на какое число"), "time": re.compile(r"какое (?:точное )?время|во сколько"),
+        "guests": re.compile(r"сколько (?:человек|гостей|вас)"), "name": re.compile(r"чьё имя|чье имя|какое имя|как вас зовут")}
 BARE_YES = ("да", "ага", "угу", "ок", "окей", "давай", "давайте", "конечно")
 OFFER_BOOK = re.compile(r"(?:хотите|помогу|могу|желаете).{0,50}(?:брон|столик)|(?:брон|столик).{0,50}(?:хотите|помогу|желаете)")
 BOOK_ASK = "Отлично! Подскажите, пожалуйста, на какую дату, на какое время, сколько человек будет и на чьё имя оформить бронь?"
@@ -257,6 +260,9 @@ class Orchestrator:
                 sess.slots.update(sess.last_slots)
                 return self._direct(sess, clean, GUEST_LIMIT_TEXT, "код: больше 6 гостей", close=False)
             sess.slots.update(sess.last_slots)
+            if (self.grounding and not sess.pending_book and sess.last_slots and "отмен" not in norm
+                    and self._slots_complete(sess) and self._booking_wanted(sess)):
+                return await self._drive_booking(chat_id, sess, clean)       # дата, время, гости и имя названы — проверяет база, а не модель
             if sess.pending_book:
                 res = await self._confirm(chat_id, sess, clean, user_name, on_progress)
             else:
@@ -353,6 +359,19 @@ class Orchestrator:
                     if (is_booking_talk or has_facts) and not self._booking_wanted(sess):
                         return self._fallback(sess, out, f"chat={chat_id}: модель начала бронь в тексте без просьбы гостя: {reply.raw!r}")
                         
+                    # 1б. «Столик занят» — только если это сказала база в этом ходу; иначе модель выдумала
+                    if BUSY_CLAIM.search(text.lower()) and self._booking_wanted(sess) \
+                            and not any(st.get("result") in ("unavailable", "table_busy") for st in out.steps):
+                        log.warning("chat=%s: модель написала «занят» без проверки базы: %r", chat_id, text)
+                        if self._slots_complete(sess):
+                            return await self._drive_booking(chat_id, sess, user_text)
+                        return self._fallback(sess, out, f"chat={chat_id}: выдуманное «столик занят», данных брони не хватает")
+                    # 1в. Модель переспрашивает то, что гость уже сказал (код это нашёл в его словах)
+                    asked_known = [k for k, rx in ASKS.items() if rx.search(text.lower()) and k in sess.slots]
+                    if asked_known and self._booking_wanted(sess):
+                        if self._slots_complete(sess):
+                            return await self._drive_booking(chat_id, sess, user_text)
+                        text = self._ask_missing(sess, [f[0] for f in FIELDS if f[1] not in sess.slots]) or text
                     # 2. Если бронь запрошена, но модель галлюцинирует конкретные цифры (или пишет "Понял/Записал")
                     if (has_facts or re.match(r"(Понял|Записал|Принял):", text)) and not self._ack_ok(sess, text):
                         text = self._ask_missing(sess, [f[0] for f in FIELDS if f[1] not in sess.slots]) or text   # не верим цифрам модели
@@ -666,6 +685,39 @@ class Orchestrator:
             return None
         log.info("вопрос про блюдо %r решил код: найдено %d", topic, len(found or {}))
         return self._direct(sess, clean, text, "код: меню")
+
+    @staticmethod
+    def _slots_complete(sess: Session) -> bool:
+        return all(sess.slots.get(k) for k in ("date", "time", "guests", "name"))
+
+    async def _drive_booking(self, chat_id: int, sess: Session, clean: str) -> TurnResult:
+        """Все четыре поля названы гостем (их нашёл код): дату, время, лимит гостей, активную бронь и свободный стол проверяет сам код
+        по базе, затем гость подтверждает. Модель текстом «занят» / «записал» больше ничего не решает."""
+        s, now = sess.slots, self.now()
+        sess.booking_ok = True
+        p = {"DATE": str(s["date"]), "TIME": str(s["time"]), "GUESTS": str(s["guests"]), "NAME": str(s["name"])}
+        err = validate_booking_date(p["DATE"], now.date())
+        if err:
+            sess.slots.pop("date", None)
+            return self._direct(sess, clean, err, "код: бронь", close=False)
+        result, direct = await self._run_tool(chat_id, sess, Reply(raw="", action="call_free_tables_agent", params=p))
+        if direct:
+            if direct != GUEST_LIMIT_TEXT:
+                sess.slots.pop("time", None)                             # время неверно — переспросим (число гостей _run_tool уже убрал)
+            return self._direct(sess, clean, direct, "код: бронь", close=False)
+        if str(result).startswith("active_booking"):
+            a = await asyncio.to_thread(self.db.active_booking, chat_id, now)
+            text = f"У вас есть бронь: {booking_line(a.date, a.time, a.guests, a.name)}. Отменить её?" if a else \
+                "У вас уже есть активная бронь. Отменить её?"
+            return self._direct(sess, clean, text, "код: бронь", close=False)
+        if result != "available":
+            w = "человека" if int(p["GUESTS"]) % 10 in (2, 3, 4) and int(p["GUESTS"]) % 100 not in (12, 13, 14) else "человек"
+            sess.slots.pop("time", None)
+            return self._direct(sess, clean, f"К сожалению, {p['DATE']} в {p['TIME']} столик на {p['GUESTS']} {w} занят. "
+                                             "Напишите, пожалуйста, другое время, и я проверю снова.", "код: бронь", close=False)
+        out = TurnResult()
+        self._ask_confirm(sess, p, out)
+        return self._direct(sess, clean, out.messages[0].text, "код: бронь", close=False)
 
     def _booking_in_progress(self, sess: Session) -> bool:
         """Шла ли бронь до этой реплики: код уже что-то собрал, или бот / гость в последних репликах говорили о брони.
