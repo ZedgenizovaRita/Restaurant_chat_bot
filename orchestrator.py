@@ -81,7 +81,7 @@ AVAIL_SKIP = ("розетк", "чаев", "стульчик", "гардероб"
 AVAIL_GENERIC = ("блюд", "еда", "еду", "напит", "десерт", "закуск", "горяч", "основн", "суп", "салат", "ролл", "суш", "лапш", "остр",
                  "сладк", "вегет", "веган", "постн")
 AVAIL_MAX = 5
-CHECK_BOOKING2 = re.compile(r"(?:мо[яюиеё]|моих)\s+(?:\w{1,16}\s+){0,2}брон\w{0,12}|у меня\s+(?:\w{1,16}\s+){0,4}брон\w{0,12}|(?:^|\s)есть\s+(?:ли\s+)?(?:активн\w{1,16}\s+)?брон\w{0,12}$")
+CHECK_BOOKING2 = re.compile(r"(?:^|\s)(?:я|мы)\s+(?:уже\s+)?(?:брониров|резервиров|записыв|заказыв\w{0,8}\s+стол)\w{0,10}|(?:мо[яюиеё]|моих)\s+(?:\w{1,16}\s+){0,2}брон\w{0,12}|у меня\s+(?:\w{1,16}\s+){0,4}брон\w{0,12}|(?:^|\s)есть\s+(?:ли\s+)?(?:активн\w{1,16}\s+)?брон\w{0,12}$")
 NOT_CHECK = re.compile(r"вопрос|отмен|перенес|перенос|измен|удал|заброн|хочу|нужн|сдела|оформ|нов[уы]ю|нов[ыо]е|свободн|\d")
 WORD_NUMS = {"один": 1, "одна": 1, "одного": 1, "одну": 1, "двое": 2, "два": 2, "две": 2, "двоих": 2, "вдвоем": 2, "трое": 3, "три": 3, "троих": 3,
              "втроем": 3, "четверо": 4, "четыре": 4, "четверых": 4, "вчетвером": 4, "пятеро": 5, "пять": 5, "шестеро": 6, "шесть": 6, "семеро": 7, "семь": 7}
@@ -129,6 +129,10 @@ ADDRESS_TEXT = "Мы находимся по адресу: Москва, ул. �
 TRAVEL_TEXT = " Сколько займёт дорога, зависит от того, откуда вы поедете, — построить маршрут можно в навигаторе."
 HOURS_TEXT = "Мы работаем каждый день с 10:00 до 23:00. Бизнес-ланчи — по будням с 12:00 до 16:00."
 DB_FAIL_TEXT = "Сейчас не получается обратиться к базе броней. Попробуйте, пожалуйста, чуть позже или обратитесь к администратору ресторана."
+NOT_NAMES = {"хочу", "мне", "нужно", "нужен", "можно", "пожалуйста", "здравствуйте", "привет", "добрый", "спасибо", "да", "нет", "завтра", "сегодня",
+             "послезавтра", "понедельник", "вторник", "среда", "среду", "четверг", "пятница", "пятницу", "суббота", "субботу", "воскресенье", "января", "февраля",
+             "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря", "вечером", "утром", "днём", "днем", "ночью",
+             "человек", "человека", "гостей", "один", "одна", "двое", "трое", "четверо", "столик", "стол", "бронь", "брони", "имя", "меня", "зовут", "ладно"}
 CAPS_WORDS = re.compile(r"что (?:ты|вы) (?:умеешь|умеете|можешь|можете)|чем (?:ты |вы )?(?:можешь|можете|поможешь|поможете)|что ты за бот|(?:^| )помощь(?: |$)")
 CAPS_TEXT = ("Я бот ресторана YUQI. Могу рассказать про меню и цены, подсказать блюда, назвать бизнес-ланчи, адрес и часы работы, "
              "а также забронировать, проверить или отменить бронь столика.")
@@ -319,6 +323,10 @@ class Orchestrator:
                 sess.last_slots["guests"] = str(self._word_guests(norm, expecting))     # «Один», «нас двое», «человек один»
             if len(sess.last_slots.get("name", "")) < 3:
                 sess.last_slots.pop("name", None)                        # «Не», «Да» — не имена
+            if "name" not in sess.last_slots and "name" not in sess.slots:
+                cand = self._name_from_reply(sess, clean)                # бот спрашивал имя вместе с другим («время и имя»), а гость ответил «Маргарита, 23:20»
+                if cand:
+                    sess.last_slots["name"] = cand
             g = sess.last_slots.get("guests")
             if g and int(g) > MAX_GUESTS:
                 sess.last_slots.pop("guests")                            # больше 6 в слоты не попадает никогда
@@ -328,6 +336,16 @@ class Orchestrator:
                     sess.slots.update(sess.last_slots)                   # «12 человек» — не «столик занят», а лимит бронирования
                     return self._direct(sess, clean, GUEST_LIMIT_TEXT, "код: больше 6 гостей", close=False)
             sess.slots.update(sess.last_slots)
+            if (self.grounding and not sess.pending_book and ("date" in sess.last_slots or "time" in sess.last_slots) and not self._slots_complete(sess)
+                    and sess.slots.get("date") and sess.slots.get("time") and self._booking_wanted(sess)):
+                try:
+                    problem = check_slot(str(sess.slots["date"]), str(sess.slots["time"]), now)
+                except Exception:
+                    log.exception("chat=%s: ранняя проверка времени упала", chat_id)
+                    problem = None
+                if problem:                                              # «23:20» — после закрытия: говорим сразу, а не после имени
+                    sess.slots.pop("time", None)
+                    return self._direct(sess, clean, problem.text, "код: бронь", close=False)
             if (self.grounding and not sess.pending_book and sess.last_slots and "отмен" not in norm
                     and self._slots_complete(sess) and self._booking_wanted(sess)):
                 try:
@@ -685,6 +703,15 @@ class Orchestrator:
                        item=p.get("ITEM") if a == "call_price_agent" else None, lunch=a == "show_business_lunch", text=text)
         except Exception:
             log.exception("не удалось запомнить показанное меню")
+
+    @staticmethod
+    def _name_from_reply(sess: Session, clean: str) -> Optional[str]:
+        """Имя из короткого ответа, если бот в последнем сообщении спрашивал имя: единственное слово с заглавной буквы, не месяц/день/«Да»."""
+        last_bot = " ".join(sess.prev_msgs).lower()
+        if not ASKS["name"].search(last_bot) or len(clean.split()) > 8:
+            return None
+        cands = [w for w in re.findall(r"(?<![а-яёa-z])[А-ЯЁ][а-яё]{2,}", clean) if w.lower() not in NOT_NAMES]
+        return cands[0] if len(cands) == 1 else None
 
     @staticmethod
     def _word_guests(norm: str, expecting: Optional[str]) -> Optional[int]:
@@ -1157,6 +1184,14 @@ class Orchestrator:
                 res.source = "код: проверка брони"
             res.messages[i] = Message(t)
 
+    @staticmethod
+    def _facts_mismatch(t: str, a) -> bool:
+        """В тексте модели дата, время, число гостей или имя не те, что в базе."""
+        return (any(d != a.date for d in re.findall(r"\d\d\.\d\d\.\d{4}", t))
+                or any(x != a.time for x in re.findall(r"(?<!\d)\d\d:\d\d", t))
+                or any(int(g) != a.guests for tup in re.findall(r"(\d+) (?:человек|гост)|человек: (\d+)", t) for g in tup if g)
+                or any(n.lower() != a.name.lower() for n in re.findall(r"имя\s*[:—-]?\s*([а-яёa-z\-]+)", t, re.I)))
+
     async def _check_claims(self, chat_id: int, res: TurnResult) -> None:
         """Любые слова модели о брони сверяются с фактами: «оформлена» — только если база ответила booked,
         «отменена» — только если cancelled, «у вас есть бронь» — только если она есть в базе и с теми же датой/временем."""
@@ -1171,7 +1206,7 @@ class Orchestrator:
                 continue
             a = await asyncio.to_thread(self.db.active_booking, chat_id, self.now())
             if CLAIM_EXISTS.search(t) and not CLAIM_BOOKED.search(t) and not CLAIM_CANCELLED.search(t) and a \
-                    and a.date in m.text and a.time in m.text:
+                    and a.date in m.text and a.time in m.text and not self._facts_mismatch(m.text, a):
                 continue                                                 # модель верно пересказала бронь из базы
             log.warning("chat=%s: слова модели о брони не совпали с базой: %r", chat_id, m.text)
             if CLAIM_CANCELLED.search(t) and "cancelled" not in results:
