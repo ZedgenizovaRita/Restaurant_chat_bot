@@ -53,7 +53,7 @@ MENU_REQ_WORDS = {"меню", "отправь", "отправьте", "приш�
                   "хочу", "хотел", "хотела", "посмотреть", "увидеть", "ваше", "ваш", "все", "всё", "полное", "мне", "пожалуйста", "а",
                   "у", "вас", "есть", "какое", "ещё", "еще", "основное", "целиком", "полностью", "и", "пока"}
 SKIP_RE = re.compile(r"брон|столик|адрес|где вы|как добрат|парковк|wi.?fi|вайфай|розетк|час\w* работы|до скольки|"
-                     r"отзыв|жалоб|алкогол|доставк|самовывоз|бизнес|ланч")
+                     r"отзыв|жалоб|(?<!без)алкогол|доставк|самовывоз|бизнес|ланч")
 FILTER_TOKEN_RE = re.compile(r"^(?:вег|неостр|остр|пряно|пикант|жгуч|постн)")
 STOPWORDS = {"какие", "какая", "какой", "есть", "вас", "меню", "блюда", "блюдо", "ваше", "ваши", "покажите", "расскажите",
              "подскажите", "хочу", "хотел", "хотела", "можно", "пожалуйста", "что", "что-нибудь", "нибудь", "еще", "ещё",
@@ -63,34 +63,117 @@ STOPWORDS = {"какие", "какая", "какой", "есть", "вас", "м
 MEAT_RE = re.compile(r"кури|курин|свин|говяд|утк|утин|бекон|мяс|колбас|ветчин|баранин|телят|индейк|карбонад")
 
 
-def detect_filter(text: str) -> Optional[str]:
+FLT_ORDER = ("no_meat", "not_spicy", "spicy", "vegan", "vegetarian")
+FLT_ADJ = {"no_meat": "без мяса", "vegan": "веганские", "vegetarian": "вегетарианские", "spicy": "острые", "not_spicy": "неострые"}
+
+
+def detect_filters(text: str) -> list[str]:
+    """Все условия из запроса: «неострое и без мяса» -> ['no_meat', 'not_spicy']."""
     t = norm(text)
+    out = []
     if re.search(r"без мяс|безмяс|не ем мяс|без мясн|мяса не|не мясн|без курицы|без свинин|без говядин", t):
-        return "no_meat"
-    if re.search(r"(?<!\w)не\s?(?:очень\s)?(?:остр|пряно|пикант|жгуч)|неостр|без остро|нежгуч|нейтральн|для дет|ребен|ребён|детям", t):
-        return "not_spicy"
+        out.append("no_meat")
+    not_spicy = bool(re.search(r"(?<!\w)не\s?(?:очень\s)?(?:остр|пряно|пикант|жгуч)|неостр|без остро|нежгуч|нейтральн|для дет|ребен|ребён|детям", t))
+    if not_spicy:
+        out.append("not_spicy")
     for w in re.findall(r"[а-я]+", t):
         if w.startswith("веган") or w.startswith("постн"):
-            return "vegan"
+            out.append("vegan")
+            break
         if w.startswith("вег") and len(w) >= 6:                        # вегетарианское, вегетерианкие, вегетарианцам
-            return "vegetarian"
-    if re.search(r"остр|пряно|пикант|жгуч", t):
-        return "spicy"
-    return None
+            out.append("vegetarian")
+            break
+    if not not_spicy and re.search(r"остр|пряно|пикант|жгуч", t):
+        out.append("spicy")
+    if "vegan" in out or "vegetarian" in out:
+        out = [f for f in out if f != "no_meat"]                       # веганское/вегетарианское уже без мяса
+    return sorted(dict.fromkeys(out), key=FLT_ORDER.index)
+
+
+def detect_filter(text: str) -> Optional[str]:
+    """Фильтр запроса: один ('spicy') или несколько через «+» ('no_meat+not_spicy'); None — фильтров нет."""
+    fl = detect_filters(text)
+    return "+".join(fl) or None
+
+
+def flt_title(flt: Optional[str]) -> str:
+    return ", ".join(FLT_ADJ.get(f, f) for f in (flt or "").split("+") if f)
+
+
+_MENU: Optional[Menu] = None                                            # меню текущего вызова route(): нужно _apply, чтобы учесть состав комплексов
+SPICY_WORDS = re.compile(r"остр|(?<!сладкий )(?<!сладкая )(?<!сладкое )чили|кимчи|сычуан|карри|табаско|халапен|шрирач|харисс|пикант|жгуч|том.?ям")
+FISH_RE = re.compile(r"рыб|лосос|семг|тунец|тунц|угор|угр[её]м|форел|краб|креветк|мидии|кальмар|осьмин|гребеш|икр|тобико|морепрод|сашими|сибас|окун")
+
+
+def _components(it: Item, menu: Optional[Menu]) -> list[Item]:
+    """Блюда меню, названные в описании (комплекс «Мини-версия YUQI Black Ramen, гёдза с курицей…» состоит из них)."""
+    if not menu:
+        return []
+    d = norm(it.description or "")
+    return [o for o in _regular(menu) if o.name != it.name and (norm(o.name) in d or any(len(a) >= 4 and norm(a) in d for a in o.aliases))]
+
+
+def _spicy_evidence(it: Item, menu: Optional[Menu]) -> bool:
+    """В названии/описании (или в составе комплекса) есть признак остроты: «острый соус», «Том Ям», острое блюдо в составе."""
+    return any(p.spicy is True or SPICY_WORDS.search(norm(f"{p.name} {p.description or ''}")) for p in [it, *_components(it, menu)])
+
+
+def spicy_state(it: Item, menu: Optional[Menu] = None) -> Optional[str]:
+    """'yes' | 'no' | 'conflict' | None. Флаг spicy из menu.json — главный: заданный явно (true/false) переопределить нельзя.
+    Описание лишь подсказывает, где флаг и текст расходятся ('conflict' — пусть владелец меню поправит menu.json), а при spicy=null решает оно."""
+    evidence = _spicy_evidence(it, menu)
+    if it.spicy is True:
+        return "yes"
+    if it.spicy is False:
+        return "conflict" if evidence else "no"
+    if evidence:
+        return "yes"
+    comps = _components(it, menu)
+    return "no" if comps and all(c.spicy is False for c in comps) else None      # комплекс из заведомо неострых блюд
+
+
+def spicy_truth(it: Item, menu: Optional[Menu] = None) -> Optional[bool]:
+    """True/False — уверенный ответ; None — нет данных или флаг и описание расходятся (тогда не утверждаем ни «да», ни «нет»)."""
+    return {"yes": True, "no": False}.get(spicy_state(it, menu))
+
+
+def has_meat(it: Item, menu: Optional[Menu] = None) -> bool:
+    return any(MEAT_RE.search(norm(f"{p.name} {p.description or ''}")) for p in [it, *_components(it, menu)])
+
+
+def has_fish(it: Item, menu: Optional[Menu] = None) -> bool:
+    return any(FISH_RE.search(norm(f"{p.name} {p.description or ''}")) for p in [it, *_components(it, menu)])
 
 
 def _apply(items: list[Item], flt: Optional[str]) -> list[Item]:
+    if flt and "+" in flt:                                              # несколько условий сразу: каждое сужает список
+        for f in flt.split("+"):
+            items = _apply(items, f)
+        return items
     if flt == "no_meat":                                               # рыба и морепродукты можно, мяса и птицы нет
-        return [i for i in items if i.category not in ("drinks", "desserts") and not MEAT_RE.search(norm(i.name + " " + i.description))]
+        return [i for i in items if i.category not in ("drinks", "desserts") and not has_meat(i, _MENU)]
     if flt == "vegan":
         return [i for i in items if i.vegan is True]
     if flt == "vegetarian":
         return [i for i in items if i.vegetarian is True]
     if flt == "spicy":
-        return [i for i in items if i.spicy is True]
+        return [i for i in items if spicy_truth(i, _MENU) is True]
     if flt == "not_spicy":
-        return [i for i in items if i.spicy is False and i.category not in ("drinks", "desserts")]
+        return [i for i in items if spicy_truth(i, _MENU) is False and i.category not in ("drinks", "desserts")]
     return items
+
+
+def filter_messages(flt: str, menu: Menu) -> list[str]:
+    """Список блюд по одному или нескольким фильтрам: флаги меню плюс проверка кодом по описанию и составу."""
+    global _MENU
+    _MENU = menu
+    items = _apply(_regular(menu), flt)
+    title = flt_title(flt)
+    if not items:
+        return [f"К сожалению, блюд ({html.escape(title)}) в меню не нашлось. Можете посмотреть остальные варианты в меню."]
+    return _list_message(title[:1].upper() + title[1:] if "+" in (flt or "") else
+                         {"spicy": "Острые блюда", "not_spicy": "Неострые блюда", "vegan": "Веганские блюда", "vegetarian": "Вегетарианские блюда",
+                          "no_meat": "Блюда без мяса"}.get(flt, title), items)
 
 
 def _regular(menu: Menu) -> list[Item]:
@@ -99,7 +182,7 @@ def _regular(menu: Menu) -> list[Item]:
 
 def _category_of(tokens: list[str]) -> Optional[str]:
     for cat, stems in CATEGORY_STEMS.items():
-        if any(t.startswith(s) for t in tokens for s in stems):
+        if any(t.startswith(s) and not t.startswith(("супер", "сокр", "сокол", "чайк", "чайн")) for t in tokens for s in stems):   # «супер» — не суп
             return cat
     return None
 
@@ -109,7 +192,7 @@ def _dish_hits(text: str, menu: Menu) -> list[Item]:
     cat_stems = tuple(s for ss in CATEGORY_STEMS.values() for s in ss)
     name_toks = {t for it in _regular(menu) for n in (it.name, *it.aliases) for t in _tokens(n)}
     all_q = [w for w in _tokens(text) if w not in STOPWORDS and not FILTER_TOKEN_RE.match(w)
-             and (not w.startswith(cat_stems) or w in name_toks)]               # «лимонад» — и раздел, и блюдо: слово из названия — это блюдо
+             and (not w.startswith(cat_stems) or w in name_toks or any(len(w) == len(t) and w[:-1] == t[:-1] for t in name_toks))]   # «лапшу» ~ «Лапша с уткой»               # «лимонад» — и раздел, и блюдо: слово из названия — это блюдо
     q = [w for w in all_q if len(w) >= 4]                               # «лапша», «роллы» — это раздел, а не блюдо
     hits = []
     for it in _regular(menu):
@@ -139,6 +222,37 @@ def _list_message(title: str, items: list[Item]) -> list[str]:
     return split_message(f"<b>{html.escape(title)}</b>\n" + "\n".join(_item_line(i) for i in items))
 
 
+REC_GENERIC = {"блюдо", "блюда", "блюдом", "блюду", "вкусное", "вкусный", "вкусную", "что", "нибудь", "мне", "нам", "можно", "ужин", "обед", "завтрак",
+               "двоих", "компанию", "перекус", "десерт", "напиток", "порцию", "поесть", "покушать", "съесть", "взять", "заказать", "попробовать",
+               "интересное", "интересный", "необычное", "новое", "другое", "ещё", "еще", "сегодня", "вечером", "пожалуйста", "хочется", "хочу"}
+
+
+def _ingredient_pool(text: str, menu: Menu, flt: Optional[str], cat: Optional[str]) -> tuple[list[str], list[Item]]:
+    """«Посоветуй блюдо из риса / с креветками / рыбное» -> (слова-ингредиенты, блюда, где они есть в названии/описании/составе)."""
+    cat_stems = tuple(st for ss in CATEGORY_STEMS.values() for st in ss)
+    q = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in REC_GENERIC and not FILTER_TOKEN_RE.match(w)
+         and not re.search(r"(?:ть|ться|ите|йте|ешь|ется)$", w) and not w.startswith(("пообед", "поужин", "позавтрак", "перекус", "голод"))   # глаголы — не ингредиент
+         and not w.startswith(cat_stems) and not re.match(r"посовет|порекоменд|подскаж|рекоменд|предлож|совет", w)]
+    if not q:
+        return [], []
+    hits = []
+    for it in _regular(menu):
+        hay = " ".join([it.name, *it.aliases, it.description or ""]) + " " + " ".join(c.name + " " + (c.description or "") for c in _components(it, menu))
+        toks = _tokens(hay)
+        ok = True
+        for w in q:
+            if w.startswith(("рыб", "морепрод")):
+                ok = ok and bool(FISH_RE.search(norm(hay)))
+            elif w.startswith("мяс"):
+                ok = ok and has_meat(it, menu)
+            else:
+                st = w[:max(3, len(w) - 2)]
+                ok = ok and any(t.startswith(st) for t in toks)
+        if ok:
+            hits.append(it)
+    return q, hits
+
+
 def _recommend(text: str, menu: Menu, rng: random.Random, flt: Optional[str], ctx: Optional[dict] = None) -> list[str]:
     t = norm(text)
     names = set((ctx or {}).get("names") or ())
@@ -149,6 +263,13 @@ def _recommend(text: str, menu: Menu, rng: random.Random, flt: Optional[str], ct
         return _pick_message(pool, rng, 3 if re.search(r"двоих|компани|вчетвером|втроем|втроём", t) else 2, ctx, flt)
     pool = _apply([i for i in _regular(menu) if i.category not in ("drinks", "desserts")], flt)
     cat = _category_of(_tokens(text))
+    q, ing = _ingredient_pool(text, menu, flt, cat)
+    if q:                                                               # «блюдо из риса» — только блюда, где это есть, а не любые
+        ing = _apply([i for i in ing if not cat or i.category == cat], flt)
+        if not ing:
+            return [f"Блюд с «{html.escape(' '.join(q))}» (с учётом ваших пожеланий) в меню не нашёл. Скажите, что ещё по вкусу — "
+                    "острое, без мяса, лёгкое или посытнее, — и я подберу."]
+        return _pick_message(ing, rng, 3 if re.search(r"двоих|компани|вчетвером|втроем|втроём|нас \d|на \d", t) else 2, ctx, flt)
     if cat:
         pool = [i for i in pool if i.category == cat] or pool
     if re.search(r"десерт|сладк", t):
@@ -165,7 +286,8 @@ def _recommend(text: str, menu: Menu, rng: random.Random, flt: Optional[str], ct
             msgs = _pick_message(veg, rng, 3, ctx, "vegetarian")
             return ["Строго веганских блюд с такой пометкой в нашем меню нет, но есть вегетарианские — без мяса и рыбы. Могу предложить:\n" + msgs[0].split("\n", 1)[-1]] + msgs[1:]
     if not pool:
-        title = {"no_meat": "блюд без мяса", "vegan": "веганских", "vegetarian": "вегетарианских", "spicy": "острых", "not_spicy": "неострых"}.get(flt or "", "подходящих")
+        title = ({"no_meat": "блюд без мяса", "vegan": "веганских", "vegetarian": "вегетарианских", "spicy": "острых", "not_spicy": "неострых"}.get(flt or "")
+                 or (f"подходящих ({flt_title(flt)})" if flt else "подходящих"))
         return [f"К сожалению, {title} блюд в меню не нашлось. Можете посмотреть остальные варианты в меню."]
     return _pick_message(pool, rng, 3 if re.search(r"двоих|компани|вчетвером|втроем|втроём|нас \d|на \d", t) else 2, ctx, flt)
 
@@ -191,7 +313,7 @@ def _pick_message(pool: list[Item], rng: random.Random, n: int, ctx: Optional[di
             picks.append(i)
     if ctx is not None:
         crit = {"no_meat": "из блюд без мяса", "vegan": "из веганских блюд", "vegetarian": "из вегетарианских блюд",
-                "spicy": "из острых блюд", "not_spicy": "из неострых блюд"}.get(flt or "", "из меню")
+                "spicy": "из острых блюд", "not_spicy": "из неострых блюд"}.get(flt or "") or (f"из блюд ({flt_title(flt)})" if flt else "из меню")
         ctx["names"], ctx["flt"], ctx["fresh"] = [i.name for i in picks], flt, True
         ctx["rec"], ctx["rec_fresh"] = {"pool": [i.name for i in pool], "shown": [i.name for i in picks], "flt": flt}, True
         ctx["why"] = _why_for_items(picks, f"Конечно! Я выбирал {crit}, старался предложить разные позиции, а фирменные советую чаще. Вот что отмечено в меню:")
@@ -223,6 +345,48 @@ SPICY_Q_RE = re.compile(r"остр|пряно|пикант|жгуч")
 VEG_Q_RE = re.compile(r"веган|вегет|постн")
 
 
+MEAT_Q_RE = re.compile(r"мяс|мясн")
+LUNCH_GENERIC = {"lunch", "ланч", "ланчи", "ланча", "бизнес", "yuqi", "обед", "остр", "острый", "острая", "острое"}
+
+
+def _lunch_hits(text: str, menu: Menu) -> list[Item]:
+    q = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in LUNCH_GENERIC and not FILTER_TOKEN_RE.match(w)]
+    hits = []
+    for it in menu.items:
+        if it.business_lunch and any(_same(a, b) for a in q for b in _tokens(it.name) if len(b) >= 3 and b not in LUNCH_GENERIC):
+            hits.append(it)
+    return hits
+
+
+def _answer_lunch(items: list[Item], t: str, menu: Menu) -> str:
+    """Бизнес-ланч — набор блюд: острота, мясо, рыба, веган проверяются по каждому блюду в составе."""
+    e, parts = html.escape, []
+    for it in items[:3]:
+        d = (it.description or "").rstrip(".")
+        line = f"<b>{e(it.name)}</b>" + (f" — {e(d)}." if d else ".")
+        if SPICY_Q_RE.search(t):
+            line += " Да, в составе есть острое." if spicy_truth(it, menu) is True else " Острого в составе не отмечено."
+        if MEAT_Q_RE.search(t):
+            line += " Да, в составе есть мясо или птица." if has_meat(it, menu) else " Мяса и птицы в составе нет."
+        if VEG_Q_RE.search(t):
+            line += (" Вегетарианским комплекс не назвать — в нём есть мясо или рыба." if has_meat(it, menu) or has_fish(it, menu)
+                     else " По составу вегетарианское.")
+        parts.append(line)
+    return "\n\n".join(parts)
+
+
+def _meat_answer(items: list[Item], menu: Menu) -> str:
+    e, parts = html.escape, []
+    for it in items[:3]:
+        if has_meat(it, menu):
+            parts.append(f"Да, в «<b>{e(it.name)}</b>» есть мясо или птица: {e((it.description or '').rstrip('.').lower() or 'см. меню')}.")
+        elif has_fish(it, menu):
+            parts.append(f"Мяса и птицы в «<b>{e(it.name)}</b>» нет, но есть рыба или морепродукты: {e((it.description or '').rstrip('.').lower())}.")
+        else:
+            parts.append(f"Мяса и птицы в «<b>{e(it.name)}</b>» нет{(': ' + e(it.description.rstrip('.').lower())) if it.description else ''}.")
+    return "\n\n".join(parts)
+
+
 def _traits(it: Item) -> list[str]:
     out = []
     if it.signature:
@@ -239,6 +403,7 @@ def _traits(it: Item) -> list[str]:
 
 
 def _answer_dish(items: list[Item], t: str, with_text: bool, rng=random) -> str:
+    menu = _MENU
     """Живой ответ про блюдо: описание, прямой ответ на «острый ли?», «вегетарианское ли?», цена и порция."""
     e = html.escape
     parts = []
@@ -252,11 +417,15 @@ def _answer_dish(items: list[Item], t: str, with_text: bool, rng=random) -> str:
         else:
             sents.append(rng.choice([f"Про блюдо «<b>{e(it.name)}</b>» могу сказать вот что.", f"Если про блюдо «<b>{e(it.name)}</b>», то вот что могу сказать.", f"Отвечаю про «<b>{e(it.name)}</b>»."]))
         if SPICY_Q_RE.search(t):
-            if it.spicy is True:
+            state = spicy_state(it, menu)
+            spicy = {"yes": True, "no": False}.get(state)
+            if state == "conflict":
+                sents.append("В меню блюдо отмечено как неострое, но в описании есть острый компонент — лучше уточнить у официанта.")
+            elif spicy is True:
                 sents.append(rng.choice(["Да, блюдо острое — если не любите остренькое, лучше взять что-нибудь помягче.",
                                          "Острота там есть, так что учитывайте это при заказе.",
                                          "Да, оно острое, но многим как раз это и нравится."]))
-            elif it.spicy is False:
+            elif spicy is False:
                 sents.append(rng.choice(["Нет, острого там нет — блюдо мягкое.",
                                          "Оно неострое, так что подойдёт и тем, кто не любит остренькое.",
                                          "Нет, не переживайте, остроты в нём нет."]))
@@ -393,6 +562,8 @@ def expire(ctx: dict) -> None:
 def note_shown(ctx: dict, menu: Menu, *, category: Optional[str] = None, flt: Optional[str] = None,
                item: Optional[str] = None, lunch: bool = False, text: str = "") -> None:
     """Модель вызвала инструмент меню (или назвала блюда в ответе) — запоминаем, что гость увидел, для «оттуда», «а почему?», «он острый?»."""
+    global _MENU
+    _MENU = menu
     expire(ctx)
     if lunch:
         ctx["topic"], ctx["lunch_names"] = "lunch", [i.name for i in menu.items if i.business_lunch]
@@ -421,6 +592,8 @@ def note_shown(ctx: dict, menu: Menu, *, category: Optional[str] = None, flt: Op
 
 def route(text: str, menu: Menu, rng: Optional[random.Random] = None, ctx: Optional[dict] = None) -> Optional[list[str]]:
     """ctx — память чата о последнем показанном списке {"names": [...], "flt": ...}; route обновляет её сам."""
+    global _MENU
+    _MENU = menu
     out = _route(text, menu, rng or random, ctx if ctx is not None else {})
     return out
 
@@ -430,7 +603,7 @@ FLT_WHY = {"no_meat": "без мяса", "vegan": "веганские", "vegetar
 
 def _remember(ctx: dict, items: list[Item], flt: Optional[str]) -> None:
     ctx["names"], ctx["flt"], ctx["fresh"] = [i.name for i in items], flt, True
-    intro = (f"Конечно, объясню! Я отобрал блюда по отметкам в меню — {FLT_WHY[flt]}. Вот, например:" if flt in FLT_WHY
+    intro = (f"Конечно, объясню! Я отобрал блюда по отметкам в меню — {flt_title(flt)}. Вот, например:" if flt and all(f in FLT_WHY for f in flt.split("+"))
              else "Конечно, объясню! Я показал то, что нашлось в меню по вашему вопросу. Вот, например:")
     ctx["why"] = _why_for_items(items[:4], intro)
 
@@ -472,7 +645,8 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
         t = norm(text)
     elif PRONOUN_RE.search(t) and OPINION_RE.search(t) and not REC_RE.search(t) and len(t.split()) <= 5:
         return ["Про какое блюдо вы спрашиваете? Назовите его, пожалуйста — расскажу, что в нём, и подскажу, подойдёт ли оно вам."]
-    if prev_topic == "lunch" and (REF_RE.search(t) or len(t.split()) <= 4) and (REC_RE.search(t) or BEST_RE.search(t)) and not _category_of(_tokens(text)):
+    if prev_topic == "lunch" and (REF_RE.search(t) or len(t.split()) <= 4) and (REC_RE.search(t) or BEST_RE.search(t)) \
+            and not _category_of(_tokens(text)) and not detect_filter(text):
         return _lunch_recommend(menu, rng, ctx)                          # «что отсюда посоветуешь?» сразу после меню ланчей
     if ABOUT_RE.search(t) and not SKIP_RE.search(t):                     # «расскажи про ресторан»
         return [rng.choice(ABOUT_TEXTS)]
@@ -483,6 +657,9 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
             return _lunch_recommend(menu, rng, ctx)
         if PRICE_RE.search(t):                                           # «сколько стоит бизнес ланч» — цены из business_lunch.json
             return tool_show_business_lunch(menu)
+        lh = _lunch_hits(text, menu)
+        if lh and (SPICY_Q_RE.search(t) or VEG_Q_RE.search(t) or MEAT_Q_RE.search(t)):
+            return [_answer_lunch(lh, t, menu)]                          # «Bangkok Lunch острый?» — по составу комплекса, а не по догадке модели
         return None                                                      # часы работы и т.п. — по датасету
     if PRICE_RE.search(t) and not SKIP_RE.search(t):
         rest = re.sub(PRICE_RE, " ", t)
@@ -514,22 +691,37 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
     # цена
     if PRICE_RE.search(t):
         q = re.sub(PRICE_RE, " ", t)
-        if find_items(q, menu) and not _is_business(find_items(q, menu)):
+        fi = find_items(q, menu)
+        if fi and not _is_business(fi):
+            if len(fi) == 1:
+                _remember(ctx, fi, None)                                 # после цены «а что в нём?», «он острый?» — про это же блюдо
             return [_price_reply(q, menu, rng)]
+        dh = _dish_hits(q, menu)                                         # «какая цена у токпокки», «сколько стоят гёдзы» — название с лишними словами / падежом
+        if len(dh) == 1 and dh[0].price is not None:
+            _remember(ctx, dh, None)
+            return [_price_reply(dh[0].name, menu, rng)]
         return None
 
     # фирменное
-    if re.search(r"фирменн|авторск|визитн|шеф", t):
+    if re.search(r"фирменн|авторск|визитн|от шеф|шеф.?блюд|блюд\w* шеф|совет\w* шеф", t):
         sig = [i for i in _regular(menu) if i.signature]
         if sig:
             return tool_show_menu("signature", menu)
+
+    # «В Black Ramen есть мясо?», «Токпокки мясное?»
+    if MEAT_Q_RE.search(t) and not re.search(r"какие|какой|какая|посовет|что.нибудь|блюда без|без мяс|безмяс", t):
+        found = _dish_hits(text, menu)
+        if found and len(found) <= 2:
+            _remember(ctx, found, None)
+            return [_meat_answer(found, menu)]
 
     # «В матчу входит молоко?» — есть ли ингредиент в описании названного блюда (честно: только по тексту меню)
     if CONTAINS_RE.search(t) and not COMPOSE_RE.search(t):
         found = _dish_hits(text, menu)
         if found and len(found) <= 2:
             name_tokens = [n for it in found for n in _tokens(it.name)]
-            ing = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in CONTAINS_STOP
+            _cs = tuple(st for ss in CATEGORY_STEMS.values() for st in ss)
+            ing = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in CONTAINS_STOP and not w.startswith(_cs)
                    and not any(_same(w, n) for n in name_tokens)]
             if ing:
                 e, outs = html.escape, []
@@ -550,6 +742,8 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
     if COMPOSE_RE.search(t):
         found = _dish_hits(text, menu)
         if not found:
+            if PRONOUN_RE.search(t):                                     # «а что туда входит?» без предыдущего блюда
+                return ["Про какое блюдо вы спрашиваете? Назовите его, пожалуйста — расскажу, что в нём, и подскажу цену."]
             return ["Не нашёл такое блюдо в меню. Напишите, пожалуйста, название точнее — подскажу состав и цену."]
         _remember(ctx, found[:3], None)
         ctx["why"] = _why_for_items(found[:3], "Я опираюсь на карточку блюда в нашем меню:")
@@ -601,7 +795,7 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
     dish = _dish_hits(text, menu)
     cat = _category_of(tokens)
     ingr = [] if (dish or cat) else _ingredient_hits(text, menu)
-    asks = bool(LIST_RE.search(t)) or len(tokens) <= 3 or bool(OPINION_RE.search(t))
+    asks = bool(LIST_RE.search(t)) or bool(re.search(r"\bесть\b", t)) or len(tokens) <= 3 or bool(OPINION_RE.search(t)) or (flt is not None and len(tokens) <= 8)   # «только неострое и без мяса, пожалуйста»
     if dish and OPINION_RE.search(t) and len(dish) <= 3 and not flt:      # «а токпокки вкусные?» — про это блюдо, а не список
         _remember(ctx, dish, None)
         return [_opinion_many(dish, rng)]
@@ -619,14 +813,14 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
             lead = rng.choice(["Вкусы у всех разные, но выбор такой — смотрите, что из этого вам по душе:", "За каждого гостя решать не берусь, зато могу показать, что у нас есть:"])
             return split_message(f"{lead}\n" + "\n".join(_item_line(i) for i in items))
         return _list_message(title, items) if items else [f"В разделе «{html.escape(title)}» подходящих блюд не нашлось. Можете посмотреть остальное меню."]
-    if flt == "no_meat" and asks:
+    if flt == "no_meat" and asks:                                        # только «без мяса»; с другими условиями — filter_messages ниже
         items = _apply(_regular(menu), flt)
         if items:
             _remember(ctx, items, flt)
         return _list_message("Блюда без мяса (рыба и морепродукты — да, мясо и птица — нет)", items) if items else None
     if flt and asks:
         _remember(ctx, _apply(_regular(menu), flt), flt)
-        return tool_filter(flt, menu)
+        return filter_messages(flt, menu)
     if ingr and asks:
         items = _apply(ingr, flt)
         _remember(ctx, items, flt)

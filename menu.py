@@ -122,6 +122,8 @@ def check_menu(menu: Menu) -> list[str]:
         seen.add(it.name)
         if it.price is None:
             w.append(f"нет цены: {it.name}")
+        if it.spicy is False and re.search(r"остр|(?<!сладкий )чили|кимчи|сычуан|карри|табаско|халапен|шрирач|харисс|пикант|жгуч|том.?ям", norm(it.name + " " + it.description)):
+            w.append(f"spicy=false, но в названии/описании есть острое: {it.name} — проверьте флаг")
         if not it.business_lunch and it.category not in CATEGORY_TITLES:
             w.append(f"неизвестная категория у «{it.name}»: {it.category!r}")
     return w
