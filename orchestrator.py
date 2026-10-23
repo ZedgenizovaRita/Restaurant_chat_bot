@@ -38,7 +38,7 @@ from db import BookingDB, check_slot
 from llm import GenResult, PromptTooLong
 from menu import Menu, find_items, norm as menu_norm, fmt_price, get_menu, tool_filter, tool_price, tool_show_business_lunch, tool_show_menu
 import topic_gate as tg
-from menu_router import BEST_RE, COMPOSE_RE, MEAT_Q_RE, PRICE_RE, REC_RE, SPICY_Q_RE, _category_of, _list_message, _regular, _dish_hits, _same, _tokens, detect_filter, filter_messages, note_shown, route
+from menu_router import BEST_RE, EXCL_RE, COMPOSE_RE, MEAT_Q_RE, PRICE_RE, REC_RE, SPICY_Q_RE, _category_of, _list_message, _regular, _dish_hits, _same, _tokens, detect_filter, filter_messages, note_shown, route
 from slots import extract as extract_slots
 from protocol import DialogHistory, Reply, TOOLS_WITH_RESULT, expects_answer, parse_reply, sanitize_user_text, validate_action
 
@@ -100,6 +100,10 @@ NO_INFO_TEXT = ("К сожалению, у меня нет информации 
                 "Уточните, пожалуйста, у администратора ресторана. Могу подсказать по меню, ценам или помочь с бронью.")
 GROUND_OK = re.compile(r"какие|какой|какая|какое|что у вас|покажи|расскажи|подскажи|что.нибудь|предлож|посовет")   # список/совет — любые блюда уместны
 # просьбы, которых бот не умеет: набор под бюджет, заказ и доставка еды (он только отвечает про меню и бронирует столики)
+SIZE_Q = re.compile(r"больш\w{0,6} (?:ли )?(?:у вас )?(?:ресторан|зал)|мал\w{0,6} (?:ли )?(?:у вас )?(?:ресторан|зал)|размер\w* (?:ресторан|зал)|вместимост|"
+                    r"сколько (?:у вас )?(?:мест|столов|столиков|этажей|залов)|\bплощад|(?:ресторан|зал) больш|этаж|много (?:у вас )?(?:мест|столиков|столов)")
+SIZE_TEXT = ("К сожалению, у меня нет информации о размере зала и количестве мест. Уточните, пожалуйста, у администратора ресторана. "
+             "Могу помочь забронировать столик.")
 STAFF = re.compile(r"повар|официант|бармен|сотрудник|персонал|ваканси|трудоустро|устро\w+ (?:к вам |у вас )?на работу|на работу|резюме|стажир|"
                    r"работать у вас|работу у вас|работа у вас|набираете|ищете (?:повар|официант|сотрудник)")
 STAFF_TEXT = ("К сожалению, у меня нет информации о сотрудниках и вакансиях. Уточните, пожалуйста, у администратора ресторана. "
@@ -825,6 +829,8 @@ class Orchestrator:
                 res.messages += [Message(t, True) for t in msgs[1:]]
                 return res
             return self._direct(sess, clean, f"Блюд до {fmt_price(cap)} в нашем меню не нашёл.", "код: цена")
+        if SIZE_Q.search(norm) and len(norm.split()) <= 10 and not BOOKING_WORDS.search(norm):
+            return self._direct(sess, clean, SIZE_TEXT, "код: нет данных")
         if not tg.output_ok("review", [norm]) and (STAFF.search(norm) or (re.search(r"шеф", norm) and not re.search(r"блюд|меню|совет|рекоменд|фирменн", norm))) \
                 and len(norm.split()) <= 10 and not BOOKING_WORDS.search(norm):
             return self._direct(sess, clean, STAFF_TEXT, "код: нет данных")              # про персонал и вакансии у бота данных нет
@@ -918,7 +924,7 @@ class Orchestrator:
         """«у вас есть мидии?», «а с рыбой?» -> (['мидии'], True); иначе None (это не вопрос про блюдо).
         Второе значение: можно ли отвечать «не нашёл». «Какой у вас рейтинг?» — не про блюдо, и если в меню ничего нет,
         отвечать «нет такого блюда» нельзя: пусть отвечает модель."""
-        if len(norm.split()) > 8 or BOOKING_WORDS.search(norm) or COMPOSE_RE.search(norm):      # «из чего X» — про состав, не про наличие
+        if len(norm.split()) > 8 or BOOKING_WORDS.search(norm) or COMPOSE_RE.search(norm) or EXCL_RE.search(norm):      # «из чего X» — про состав, не про наличие
             return None
         for rx in AVAIL:
             m = rx.search(norm)

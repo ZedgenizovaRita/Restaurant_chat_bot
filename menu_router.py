@@ -71,7 +71,7 @@ def detect_filters(text: str) -> list[str]:
     """Все условия из запроса: «неострое и без мяса» -> ['no_meat', 'not_spicy']."""
     t = norm(text)
     out = []
-    if re.search(r"без мяс|безмяс|не ем мяс|без мясн|мяса не|не мясн|без курицы|без свинин|без говядин", t):
+    if re.search(r"без мяс|безмяс|не ем мяс|без мясн|мяса не|не мясн", t):
         out.append("no_meat")
     not_spicy = bool(re.search(r"(?<!\w)не\s?(?:очень\s)?(?:остр|пряно|пикант|жгуч)|неостр|без остро|нежгуч|нейтральн|для дет|ребен|ребён|детям", t))
     if not_spicy:
@@ -145,7 +145,51 @@ def has_fish(it: Item, menu: Optional[Menu] = None) -> bool:
     return any(FISH_RE.search(norm(f"{p.name} {p.description or ''}")) for p in [it, *_components(it, menu)])
 
 
+_EXCL: list[str] = []                                                    # «без манго» из текущего вопроса: блюда с этим в состав не попадают
+EXCL_SKIP = {"мяса", "мясо", "мясного", "острого", "острое", "острой", "остроты", "пряного", "пожалуйста",
+             "него", "нее", "неё", "ничего", "всего", "лишнего", "глютена", "лактозы", "сахара", "аллергенов", "добавок"}   # эти слова разбирают фильтры/модель
+EXCL_RE = re.compile(r"(?i)(?<![а-яёa-z])(?:без|кроме|исключая|исключи)\s+([а-яёa-z\-]+(?:(?:\s*,\s*|\s+(?:и|или)\s+)[а-яёa-z\-]+){0,3})")
+
+
+def _extract_exclusions(text: str) -> tuple[list[str], str]:
+    """«десерты без манго» -> (['манго'], 'десерты'); «без мяса» оставляем как есть — его разбирают фильтры."""
+    words: list[str] = []
+    out = text
+    for m in EXCL_RE.finditer(text):
+        ws = [w for w in re.split(r"\s*,\s*|\s+(?:и|или)\s+|\s+", m.group(1).lower().replace("ё", "е")) if len(w) >= 3 and w not in ("пожалуйста", "покажи", "покажите")]
+        keep = [w for w in ws if w in EXCL_SKIP]
+        take = [w for w in ws if w not in EXCL_SKIP]
+        if take:
+            words += take
+            out = out.replace(m.group(0), (" без " + " ".join(keep)) if keep else " ")
+    return words, " ".join(out.split())
+
+
+def _excluded(it: Item) -> bool:
+    """В блюде (названии, описании, составе комплекса) есть то, что гость просил убрать."""
+    if not _EXCL:
+        return False
+    toks = _tokens(" ".join([it.name, *it.aliases, it.description or ""]) + " " + " ".join(c.name + " " + (c.description or "") for c in _components(it, _MENU)))
+    for w in _EXCL:
+        if w.startswith(("рыб", "морепрод")):
+            if has_fish(it, _MENU):
+                return True
+        elif w.startswith("мяс"):
+            if has_meat(it, _MENU):
+                return True
+        else:
+            st = w[:max(3, len(w) - 2)]
+            if any(t.startswith(st) for t in toks):
+                return True
+    return False
+
+
 def _apply(items: list[Item], flt: Optional[str]) -> list[Item]:
+    res = _apply_core(items, flt)
+    return [i for i in res if not _excluded(i)] if _EXCL else res
+
+
+def _apply_core(items: list[Item], flt: Optional[str]) -> list[Item]:
     if flt and "+" in flt:                                              # несколько условий сразу: каждое сужает список
         for f in flt.split("+"):
             items = _apply(items, f)
@@ -222,7 +266,7 @@ def _list_message(title: str, items: list[Item]) -> list[str]:
     return split_message(f"<b>{html.escape(title)}</b>\n" + "\n".join(_item_line(i) for i in items))
 
 
-REC_GENERIC = {"блюдо", "блюда", "блюдом", "блюду", "вкусное", "вкусный", "вкусную", "что", "нибудь", "мне", "нам", "можно", "ужин", "обед", "завтрак",
+REC_GENERIC = {"блюдах", "блюдам", "блюдами", "составе", "составу", "каких", "каком", "каким", "какими", "ваших", "вашем", "вашей", "блюдо", "блюда", "блюдом", "блюду", "вкусное", "вкусный", "вкусную", "что", "нибудь", "мне", "нам", "можно", "ужин", "обед", "завтрак",
                "двоих", "компанию", "перекус", "десерт", "напиток", "порцию", "поесть", "покушать", "съесть", "взять", "заказать", "попробовать",
                "интересное", "интересный", "необычное", "новое", "другое", "ещё", "еще", "сегодня", "вечером", "пожалуйста", "хочется", "хочу"}
 
@@ -231,7 +275,7 @@ def _ingredient_pool(text: str, menu: Menu, flt: Optional[str], cat: Optional[st
     """«Посоветуй блюдо из риса / с креветками / рыбное» -> (слова-ингредиенты, блюда, где они есть в названии/описании/составе)."""
     cat_stems = tuple(st for ss in CATEGORY_STEMS.values() for st in ss)
     q = [w for w in _tokens(text) if len(w) >= 3 and w not in STOPWORDS and w not in REC_GENERIC and not FILTER_TOKEN_RE.match(w)
-         and not re.search(r"(?:ть|ться|ите|йте|ешь|ется)$", w) and not w.startswith(("пообед", "поужин", "позавтрак", "перекус", "голод"))   # глаголы — не ингредиент
+         and not re.search(r"(?:ть|ться|ите|йте|ете|ёте|ешь|ется|уют|ают|яют)$", w) and not w.startswith(("пообед", "поужин", "позавтрак", "перекус", "голод"))   # глаголы — не ингредиент
          and not w.startswith(cat_stems) and not re.match(r"посовет|порекоменд|подскаж|рекоменд|предлож|совет", w)]
     if not q:
         return [], []
@@ -251,6 +295,21 @@ def _ingredient_pool(text: str, menu: Menu, flt: Optional[str], cat: Optional[st
         if ok:
             hits.append(it)
     return q, hits
+
+
+USE_RE = re.compile(r"использу\w{0,6}|добавля\w{0,6}|клад[её]те|кладут|применя\w{0,6}|готовите (?:с|на|из)|делаете (?:с|на|из)|есть ли (?:\w+ )?в (?:блюдах|меню|составе)|в каких блюдах|где есть|идёт ли|идет ли")
+
+
+def _use_answer(text: str, menu: Menu) -> Optional[list[str]]:
+    """«А вы используете соусы?», «Добавляете арахис?» — где в меню это встречается (по описанию и составу). Отсутствия не утверждаем."""
+    q, hits = _ingredient_pool(text, menu, None, None)
+    if not q:
+        return None
+    shown = " ".join(q)
+    if not hits:
+        return [f"В описаниях блюд «{html.escape(shown)}» не нашёл. Точный состав лучше уточнить у официанта."]
+    head = f"Да, «{html.escape(shown)}» есть в составе таких блюд:" if len(hits) <= 8 else f"Да, «{html.escape(shown)}» есть во многих блюдах, например:"
+    return split_message(head + "\n" + "\n".join(_item_line(i) for i in hits[:8]))
 
 
 def _recommend(text: str, menu: Menu, rng: random.Random, flt: Optional[str], ctx: Optional[dict] = None) -> list[str]:
@@ -592,9 +651,13 @@ def note_shown(ctx: dict, menu: Menu, *, category: Optional[str] = None, flt: Op
 
 def route(text: str, menu: Menu, rng: Optional[random.Random] = None, ctx: Optional[dict] = None) -> Optional[list[str]]:
     """ctx — память чата о последнем показанном списке {"names": [...], "flt": ...}; route обновляет её сам."""
-    global _MENU
+    global _MENU, _EXCL
     _MENU = menu
+    _EXCL, text = _extract_exclusions(text)                              # «без манго» не должно искать блюда с манго
+    if _EXCL and not text.strip():
+        text = "покажи меню"                                             # просто «без рыбы» — меню без рыбы
     out = _route(text, menu, rng or random, ctx if ctx is not None else {})
+    _EXCL = []
     return out
 
 
@@ -683,7 +746,15 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
                     _remember(ctx, items, None)
                     return split_message(f"{lead} Зато из раздела «{CATEGORY_TITLES[cat_hint]}» могу предложить:\n" + "\n".join(_item_line(i) for i in items))
             return [lead + " Могу подсказать, что выбрать из нашего меню — скажите, что вам по вкусу: острое, без мяса, лёгкое или посытнее."]
-    if "меню" in _tokens(text) and set(_tokens(text)) <= MENU_REQ_WORDS:          # «отправь меню» — просто всё меню
+    toks_all = set(_tokens(text))
+    if ("меню" in toks_all or _EXCL) \
+            and toks_all <= (MENU_REQ_WORDS | {"блюда", "блюдо", "еда", "еду", "кушать", "поесть", "что", "какие", "какое", "из", "без", "у", "вас", "есть", "покажи", "покажите", "нибудь", "чего", "что-нибудь"}):          # «отправь меню» — просто всё меню
+        if _EXCL:
+            blocks = [f"<b>{html.escape(CATEGORY_TITLES[c])}</b>\n" + "\n".join(_item_line(i) for i in its)
+                      for c in CATEGORY_TITLES if (its := [i for i in _regular(menu) if i.category == c and not _excluded(i)])]
+            if not blocks:
+                return [f"Блюд без «{html.escape(' '.join(_EXCL))}» в нашем меню не нашлось."]
+            return split_message(f"Меню без «{html.escape(' '.join(_EXCL))}»:\n\n" + "\n\n".join(blocks))
         return tool_show_menu("all", menu)
     flt = detect_filter(text)
     tokens = _tokens(text)
@@ -707,6 +778,14 @@ def _route(text: str, menu: Menu, rng, ctx: dict) -> Optional[list[str]]:
         sig = [i for i in _regular(menu) if i.signature]
         if sig:
             return tool_show_menu("signature", menu)
+
+    # «А вы используете соусы?» — про ингредиент вообще, а не про название блюда
+    if USE_RE.search(t):
+        q_use, _ = _ingredient_pool(text, menu, None, None)
+        if len(q_use) == 1 or not _dish_hits(text, menu):                # одно слово-ингредиент («соусы») — это вопрос про ингредиент, даже если оно есть в названии блюда
+            ans = _use_answer(text, menu)
+            if ans:
+                return ans
 
     # «В Black Ramen есть мясо?», «Токпокки мясное?»
     if MEAT_Q_RE.search(t) and not re.search(r"какие|какой|какая|посовет|что.нибудь|блюда без|без мяс|безмяс", t):
